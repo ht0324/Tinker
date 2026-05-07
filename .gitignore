@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+dist/
+
+# Runtime task state and private local config
+status.tsv
+task.log
+ledger.jsonl
+latest-summary.json
+*.lock/
+*.rebuild-*.bak
+config.env
+*.local.env
