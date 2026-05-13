@@ -6,6 +6,10 @@
 
 TinkerBar is a small macOS menu bar app for personal automations that are too useful to forget, but too small to deserve a whole app of their own.
 
+<p align="center">
+  <img src="assets/tinkerbar-menu-screenshot.jpg" alt="TinkerBar menu showing enabled automations and task details" width="900">
+</p>
+
 It watches a folder of task definitions, shows their status in the menu bar, and runs each task's `run.sh` either on a schedule or when files appear in a watched folder. The app handles the menu, scheduling, launch-at-login, status refreshes, and log shortcuts; each worker stays as a plain shell script that is easy to read, replace, or delete.
 
 ## Highlights
