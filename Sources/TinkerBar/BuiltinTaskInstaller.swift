@@ -90,6 +90,18 @@ struct BuiltinTaskInstaller {
                 intervalSeconds: 1800,
                 openPath: "~/Library/Application Support/TinkerBar/tasks/codex-usage-ledger"
             ),
+            AutomationTaskConfiguration(
+                id: "parsec-macmini-mirror",
+                name: "Parsec Mac Mini Mirror",
+                detail: "Mirror local Parsec launch and quit events to the Mac mini.",
+                scriptKind: "parsec_macmini_mirror",
+                triggerKind: .application,
+                directoryPath: nil,
+                intervalSeconds: nil,
+                openPath: "~/Library/Application Support/TinkerBar/tasks/parsec-macmini-mirror",
+                applicationName: "Parsec",
+                bundleIdentifier: "tv.parsec.www"
+            ),
         ]
     }
 }

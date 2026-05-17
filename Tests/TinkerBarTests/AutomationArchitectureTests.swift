@@ -28,7 +28,7 @@ final class TaskCatalogTests: XCTestCase {
         let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory)
         let tasks = try catalog.discoverTasks()
 
-        XCTAssertEqual(tasks.map(\.id), ["codex-usage-ledger", "codex-update", "heic-to-jpeg"])
+        XCTAssertEqual(tasks.map(\.id), ["codex-usage-ledger", "codex-update", "heic-to-jpeg", "parsec-macmini-mirror"])
     }
 
     func testDiscoversCustomTaskFolderAndCreatesStatusFile() throws {
@@ -85,6 +85,40 @@ final class TaskRunnerTests: XCTestCase {
         XCTAssertEqual(call.arguments, [
             paths.scriptFile.path,
             watchedDirectory.path,
+            paths.statusFile.path,
+            paths.logFile.path,
+        ])
+    }
+
+    func testApplicationWorkerReceivesEventStatusAndLogArguments() throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        let paths = try writeTask(
+            id: "parsec",
+            name: "Parsec",
+            triggerKind: .application,
+            appSupportDirectory: appSupportDirectory,
+            applicationName: "Parsec",
+            bundleIdentifier: "tv.parsec.www"
+        )
+        let task = AutomationTaskState(
+            configuration: try loadConfiguration(from: paths.configFile),
+            paths: paths,
+            snapshot: AutomationTaskSnapshot(),
+            isEnabled: true,
+            isRunning: false
+        )
+        let capture = CommandCapture()
+        let runner = TaskRunner(commandExecutor: capture.execute)
+
+        try runner.run(task, event: .opened)
+
+        let call = try XCTUnwrap(capture.calls.first)
+        XCTAssertEqual(call.executable, "/bin/zsh")
+        XCTAssertEqual(call.arguments, [
+            paths.scriptFile.path,
+            "opened",
             paths.statusFile.path,
             paths.logFile.path,
         ])
@@ -282,6 +316,39 @@ final class AutomationRuntimeTests: XCTestCase {
     }
 
     @MainActor
+    func testApplicationEventsBypassQuietHours() async throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        try writeTask(
+            id: "parsec",
+            name: "Parsec",
+            triggerKind: .application,
+            appSupportDirectory: appSupportDirectory,
+            applicationName: "Parsec",
+            bundleIdentifier: "tv.parsec.www"
+        )
+
+        let calendar = makeUTCCalendar()
+        let capture = CommandCapture()
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+            runner: TaskRunner(commandExecutor: capture.execute),
+            quietHours: AutomationQuietHours(startHour: 1, endHour: 8, calendar: calendar),
+            dateProvider: { makeDate(hour: 2, calendar: calendar) },
+            autoload: false,
+            loadStartupState: false
+        )
+
+        runtime.reloadTasks()
+        runtime.requestTaskRun("parsec", source: .application(.opened))
+
+        let sawRun = await capture.waitForCallCount(1)
+        XCTAssertTrue(sawRun)
+        XCTAssertEqual(capture.calls.first?.arguments.dropFirst().first, "opened")
+    }
+
+    @MainActor
     func testIntervalTaskRunsAfterConfiguredDelay() async throws {
         let appSupportDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
@@ -475,6 +542,12 @@ private final class CommandCapture: @unchecked Sendable {
         lock.unlock()
         return CommandResult(exitCode: 0, stdout: "", stderr: "")
     }
+
+    func waitForCallCount(_ expectedCount: Int, timeout: TimeInterval = 1) async -> Bool {
+        await waitUntil(timeout: timeout) {
+            self.calls.count >= expectedCount
+        }
+    }
 }
 
 private final class EventCounter: @unchecked Sendable {
@@ -592,7 +665,9 @@ private func writeTask(
     triggerKind: AutomationTriggerKind,
     directoryPath: String? = nil,
     intervalSeconds: Double? = 60,
-    appSupportDirectory: URL
+    appSupportDirectory: URL,
+    applicationName: String? = nil,
+    bundleIdentifier: String? = nil
 ) throws -> AutomationTaskPaths {
     let taskDirectory = appSupportDirectory
         .appendingPathComponent("tasks", isDirectory: true)
@@ -608,7 +683,9 @@ private func writeTask(
         triggerKind: triggerKind,
         directoryPath: directoryPath,
         intervalSeconds: triggerKind == .interval ? intervalSeconds : nil,
-        openPath: nil
+        openPath: nil,
+        applicationName: applicationName,
+        bundleIdentifier: bundleIdentifier
     )
 
     let encoder = JSONEncoder()

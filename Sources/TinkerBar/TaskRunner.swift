@@ -19,10 +19,10 @@ struct TaskRunner: @unchecked Sendable {
         self.commandExecutor = commandExecutor
     }
 
-    func run(_ task: AutomationTaskState) throws {
+    func run(_ task: AutomationTaskState, event: ApplicationTriggerEvent? = nil) throws {
         try builtInTasks.ensureSupportFiles(for: task.configuration, paths: task.paths)
 
-        let result = commandExecutor("/bin/zsh", try workerArguments(for: task))
+        let result = commandExecutor("/bin/zsh", try workerArguments(for: task, event: event))
         guard result.exitCode == 0 else {
             throw AutomationError.commandFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
         }
@@ -35,10 +35,14 @@ struct TaskRunner: @unchecked Sendable {
             _ = try fileManager.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: nil)
         case .interval:
             break
+        case .application:
+            guard task.configuration.hasApplicationTarget else {
+                throw AutomationError.invalidConfiguration("\(task.configuration.name) needs an applicationName or bundleIdentifier in task.json.")
+            }
         }
     }
 
-    private func workerArguments(for task: AutomationTaskState) throws -> [String] {
+    private func workerArguments(for task: AutomationTaskState, event: ApplicationTriggerEvent?) throws -> [String] {
         switch task.configuration.triggerKind {
         case .directory:
             let directoryURL = try directoryURL(for: task.configuration)
@@ -51,6 +55,13 @@ struct TaskRunner: @unchecked Sendable {
         case .interval:
             return [
                 task.paths.scriptFile.path,
+                task.paths.statusFile.path,
+                task.paths.logFile.path,
+            ]
+        case .application:
+            return [
+                task.paths.scriptFile.path,
+                (event ?? .sync).rawValue,
                 task.paths.statusFile.path,
                 task.paths.logFile.path,
             ]

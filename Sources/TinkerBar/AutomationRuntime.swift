@@ -20,13 +20,32 @@ enum TaskRunRequestSource: Equatable, Sendable {
     case manual
     case directory
     case interval
+    case application(ApplicationTriggerEvent)
 
     var isUserInitiated: Bool {
         switch self {
         case .manual:
             return true
-        case .directory, .interval:
+        case .directory, .interval, .application:
             return false
+        }
+    }
+
+    var defersForQuietHours: Bool {
+        switch self {
+        case .directory, .interval:
+            return true
+        case .manual, .application:
+            return false
+        }
+    }
+
+    var applicationEvent: ApplicationTriggerEvent? {
+        switch self {
+        case .application(let event):
+            return event
+        case .manual, .directory, .interval:
+            return nil
         }
     }
 }
@@ -110,11 +129,12 @@ final class AutomationRuntime: ObservableObject {
     private let dateProvider: () -> Date
 
     private var directoryMonitors: [String: DirectoryMonitor] = [:]
+    private var applicationMonitors: [String: ApplicationMonitor] = [:]
     private var pendingRunTasks: [String: Task<Void, Never>] = [:]
     private var intervalTimers: [String: DispatchSourceTimer] = [:]
     private var quietHourDeferredRunTimers: [String: DispatchSourceTimer] = [:]
     private var runningTaskIDs: Set<String> = []
-    private var coalescedDirectoryRunIDs: Set<String> = []
+    private var coalescedRunSources: [String: TaskRunRequestSource] = [:]
 
     private let codexUsageTaskID = "codex-usage-ledger"
 
@@ -234,8 +254,11 @@ final class AutomationRuntime: ObservableObject {
         }
 
         if tasks[index].isRunning {
-            if source == .directory {
-                coalescedDirectoryRunIDs.insert(taskID)
+            switch source {
+            case .directory, .application:
+                coalescedRunSources[taskID] = source
+            case .manual, .interval:
+                break
             }
             return
         }
@@ -387,6 +410,15 @@ final class AutomationRuntime: ObservableObject {
             )
             timer.resume()
             intervalTimers[taskID] = timer
+        case .application:
+            let monitor = ApplicationMonitor(configuration: task.configuration) { [weak self] event in
+                Task { @MainActor in
+                    self?.requestTaskRun(taskID, source: .application(event))
+                }
+            }
+
+            try monitor.start()
+            applicationMonitors[taskID] = monitor
         }
     }
 
@@ -403,7 +435,10 @@ final class AutomationRuntime: ObservableObject {
         directoryMonitors[taskID]?.stop()
         directoryMonitors[taskID] = nil
 
-        coalescedDirectoryRunIDs.remove(taskID)
+        applicationMonitors[taskID]?.stop()
+        applicationMonitors[taskID] = nil
+
+        coalescedRunSources.removeValue(forKey: taskID)
     }
 
     private func stopAllTaskScheduling() {
@@ -436,11 +471,11 @@ final class AutomationRuntime: ObservableObject {
         Task { [weak self, runner, task, taskID, source] in
             guard let self else { return }
 
-            let outcome = await Task.detached(priority: .utility) { [runner, task] in
+            let outcome = await Task.detached(priority: .utility) { [runner, task, source] in
                 let snapshotLoader = TaskSnapshotLoader()
 
                 do {
-                    try runner.run(task)
+                    try runner.run(task, event: source.applicationEvent)
                     return TaskRunOutcome.success(snapshotLoader.snapshot(for: task.paths))
                 } catch {
                     return TaskRunOutcome.failure(
@@ -457,7 +492,7 @@ final class AutomationRuntime: ObservableObject {
     private func finishTaskRun(_ taskID: String, source: TaskRunRequestSource, outcome: TaskRunOutcome) {
         runningTaskIDs.remove(taskID)
         guard let refreshedIndex = indexOfTask(taskID) else {
-            coalescedDirectoryRunIDs.remove(taskID)
+            coalescedRunSources.removeValue(forKey: taskID)
             return
         }
 
@@ -481,14 +516,13 @@ final class AutomationRuntime: ObservableObject {
             self.message = message
         }
 
-        let shouldRunAgain = coalescedDirectoryRunIDs.remove(taskID) != nil
-        if shouldRunAgain, updatedTask.isEnabled {
-            requestTaskRun(taskID, source: .directory)
+        if let nextSource = coalescedRunSources.removeValue(forKey: taskID), updatedTask.isEnabled {
+            requestTaskRun(taskID, source: nextSource)
         }
     }
 
     private func shouldDeferForQuietHours(source: TaskRunRequestSource) -> Bool {
-        !source.isUserInitiated && quietHours.contains(dateProvider())
+        source.defersForQuietHours && quietHours.contains(dateProvider())
     }
 
     private func deferTaskRunUntilQuietHoursEnd(_ taskID: String, source: TaskRunRequestSource) {

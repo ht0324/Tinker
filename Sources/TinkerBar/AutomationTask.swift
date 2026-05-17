@@ -3,6 +3,13 @@ import Foundation
 enum AutomationTriggerKind: String, Codable, Sendable {
     case directory
     case interval
+    case application
+}
+
+enum ApplicationTriggerEvent: String, Sendable {
+    case opened
+    case closed
+    case sync
 }
 
 struct AutomationTaskConfiguration: Codable, Identifiable, Sendable {
@@ -14,6 +21,8 @@ struct AutomationTaskConfiguration: Codable, Identifiable, Sendable {
     var directoryPath: String?
     var intervalSeconds: Double?
     var openPath: String?
+    var applicationName: String? = nil
+    var bundleIdentifier: String? = nil
 
     var resolvedDirectoryURL: URL? {
         guard let directoryPath, !directoryPath.isEmpty else { return nil }
@@ -25,12 +34,30 @@ struct AutomationTaskConfiguration: Codable, Identifiable, Sendable {
         return URL(fileURLWithPath: openPath.expandingTildeInPath, isDirectory: true)
     }
 
+    var applicationTargetDescription: String? {
+        if let applicationName, !applicationName.isEmpty {
+            return applicationName
+        }
+
+        if let bundleIdentifier, !bundleIdentifier.isEmpty {
+            return bundleIdentifier
+        }
+
+        return nil
+    }
+
+    var hasApplicationTarget: Bool {
+        applicationTargetDescription != nil
+    }
+
     var triggerDescription: String {
         switch triggerKind {
         case .directory:
             return "Folder trigger"
         case .interval:
             return "Scheduled"
+        case .application:
+            return "Application trigger"
         }
     }
 
@@ -43,6 +70,8 @@ struct AutomationTaskConfiguration: Codable, Identifiable, Sendable {
                 return "No interval configured"
             }
             return "Every \(formatInterval(intervalSeconds))"
+        case .application:
+            return applicationTargetDescription ?? "No app configured"
         }
     }
 }
