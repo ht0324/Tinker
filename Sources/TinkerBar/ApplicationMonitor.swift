@@ -43,13 +43,6 @@ final class ApplicationMonitor: @unchecked Sendable {
 
         observerTokens = [
             notificationCenter.addObserver(
-                forName: NSWorkspace.willLaunchApplicationNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] notification in
-                self?.handlePotentialOpen(notification)
-            },
-            notificationCenter.addObserver(
                 forName: NSWorkspace.didLaunchApplicationNotification,
                 object: nil,
                 queue: .main

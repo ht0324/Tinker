@@ -1,5 +1,10 @@
 import Foundation
 
+struct TaskDiscovery {
+    var tasks: [AutomationTaskState] = []
+    var skippedFolders: [String] = []
+}
+
 struct TaskCatalog {
     private let fileManager: FileManager
     private let builtInTasks: BuiltinTaskInstaller
@@ -43,7 +48,7 @@ struct TaskCatalog {
         self.installsBuiltInTasks = installsBuiltInTasks
     }
 
-    func discoverTasks() throws -> [AutomationTaskState] {
+    func discoverTasks() throws -> TaskDiscovery {
         try fileManager.createDirectory(at: tasksDirectory, withIntermediateDirectories: true)
 
         if installsBuiltInTasks {
@@ -56,36 +61,42 @@ struct TaskCatalog {
             options: [.skipsHiddenFiles]
         )
 
-        var tasks: [AutomationTaskState] = []
+        var discovery = TaskDiscovery()
 
         for folderURL in folderURLs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            let resourceValues = try folderURL.resourceValues(forKeys: [.isDirectoryKey])
-            guard resourceValues.isDirectory == true else { continue }
+            let resourceValues = try? folderURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard resourceValues?.isDirectory == true else { continue }
 
             let paths = AutomationTaskPaths(taskDirectory: folderURL)
             guard fileManager.fileExists(atPath: paths.configFile.path) else { continue }
 
-            let configData = try Data(contentsOf: paths.configFile)
-            let configuration = try JSONDecoder().decode(AutomationTaskConfiguration.self, from: configData)
-            try builtInTasks.ensureSupportFiles(for: configuration, paths: paths)
+            do {
+                let configData = try Data(contentsOf: paths.configFile)
+                let configuration = try JSONDecoder().decode(AutomationTaskConfiguration.self, from: configData)
+                try builtInTasks.ensureSupportFiles(for: configuration, paths: paths)
 
-            tasks.append(
-                AutomationTaskState(
-                    configuration: configuration,
-                    paths: paths,
-                    snapshot: snapshot(for: paths),
-                    isEnabled: false,
-                    isRunning: false
+                discovery.tasks.append(
+                    AutomationTaskState(
+                        configuration: configuration,
+                        paths: paths,
+                        snapshot: snapshot(for: paths),
+                        isEnabled: false,
+                        isRunning: false
+                    )
                 )
-            )
+            } catch {
+                discovery.skippedFolders.append(folderURL.lastPathComponent)
+            }
         }
 
-        return tasks.sorted { lhs, rhs in
+        discovery.tasks.sort { lhs, rhs in
             let leftPriority = taskSortPriority(lhs.configuration.id)
             let rightPriority = taskSortPriority(rhs.configuration.id)
             guard leftPriority == rightPriority else { return leftPriority < rightPriority }
             return lhs.configuration.name.localizedCaseInsensitiveCompare(rhs.configuration.name) == .orderedAscending
         }
+
+        return discovery
     }
 
     func snapshot(for paths: AutomationTaskPaths) -> AutomationTaskSnapshot {

@@ -419,6 +419,7 @@ for host in local "${REMOTE_HOSTS[@]}"; do
   echo "[$(timestamp)] collecting $host usage from $current_date through $END_DATE"
 
   json_file=$(mktemp)
+  TEMP_FILES+=("$json_file")
   if [[ "$host" == "local" ]]; then
     if ! fetch_local_daily_range_json "$current_date" "$END_DATE" >"$json_file"; then
       rm -f "$json_file"

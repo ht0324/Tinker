@@ -163,13 +163,7 @@ struct CodexUsageSnapshot: Sendable {
                 latestDate: totals.latestDate
             )
         }
-        let yesterdayByHost = summary.yesterday?.byHost.map {
-            HostLatest(host: $0.host, date: $0.date, costUSD: $0.costUSD, totalTokens: $0.totalTokens)
-        } ?? hosts.compactMap { host in
-            let costUSD = aggregation.dailyTotalsByHost[host]?[summary.latestRecordedDate] ?? 0
-            guard costUSD > 0 else { return nil }
-            return HostLatest(host: host, date: summary.latestRecordedDate, costUSD: costUSD, totalTokens: 0)
-        }
+        let yesterday = resolvedYesterday(summary: summary, aggregation: aggregation, hosts: hosts)
 
         return CodexUsageSnapshot(
             generatedAt: summary.generatedAt,
@@ -182,9 +176,9 @@ struct CodexUsageSnapshot: Sendable {
             monthToDateByHost: summary.monthToDate.byHost.map {
                 HostSummary(host: $0.host, rows: $0.rows, totalCostUSD: $0.totalCostUSD, latestDate: $0.latestDate)
             },
-            yesterdayDate: summary.yesterday?.date ?? summary.latestRecordedDate,
-            yesterdayTotalUSD: summary.yesterday?.totalCostUSD ?? aggregation.dailyTotals[summary.latestRecordedDate, default: 0],
-            yesterdayByHost: yesterdayByHost,
+            yesterdayDate: yesterday.date,
+            yesterdayTotalUSD: yesterday.totalUSD,
+            yesterdayByHost: yesterday.byHost,
             todayDate: summary.today?.date ?? "",
             todayTotalUSD: summary.today?.totalCostUSD ?? 0,
             todayByHost: summary.today?.byHost.map {
@@ -196,6 +190,49 @@ struct CodexUsageSnapshot: Sendable {
             recentDailyTotals: recentDailyTotals,
             recentDailyByHost: recentDailyByHost
         )
+    }
+
+    private static func resolvedYesterday(
+        summary: SummaryDocument,
+        aggregation: LedgerAggregation,
+        hosts: [String]
+    ) -> (date: String, totalUSD: Double, byHost: [HostLatest]) {
+        if let yesterday = summary.yesterday {
+            let byHost = yesterday.byHost.map {
+                HostLatest(host: $0.host, date: $0.date, costUSD: $0.costUSD, totalTokens: $0.totalTokens)
+            }
+            return (yesterday.date, yesterday.totalCostUSD, byHost)
+        }
+
+        guard summary.latestRecordedDate == yesterdayDateString(inTimezone: summary.timezone) else {
+            return ("", 0, [])
+        }
+
+        let byHost = hosts.compactMap { host -> HostLatest? in
+            let costUSD = aggregation.dailyTotalsByHost[host]?[summary.latestRecordedDate] ?? 0
+            guard costUSD > 0 else { return nil }
+            return HostLatest(host: host, date: summary.latestRecordedDate, costUSD: costUSD, totalTokens: 0)
+        }
+
+        return (
+            summary.latestRecordedDate,
+            aggregation.dailyTotals[summary.latestRecordedDate, default: 0],
+            byHost
+        )
+    }
+
+    private static func yesterdayDateString(inTimezone identifier: String, now: Date = Date()) -> String? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: identifier) ?? .current
+
+        guard let yesterday = calendar.date(byAdding: .day, value: -1, to: now) else { return nil }
+
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: yesterday)
     }
 
     private static func orderedHosts(summary: SummaryDocument, ledgerHosts: Set<String>) -> [String] {

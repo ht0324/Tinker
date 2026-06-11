@@ -4,23 +4,22 @@ struct TaskRunner: @unchecked Sendable {
     typealias CommandExecutor = @Sendable (_ executable: String, _ arguments: [String]) -> CommandResult
 
     private let fileManager: FileManager
-    private let builtInTasks: BuiltinTaskInstaller
     private let commandExecutor: CommandExecutor
 
     init(
         fileManager: FileManager = .default,
-        builtInTasks: BuiltinTaskInstaller = BuiltinTaskInstaller(),
         commandExecutor: @escaping CommandExecutor = { executable, arguments in
             CommandRunner.run(executable, arguments: arguments)
         }
     ) {
         self.fileManager = fileManager
-        self.builtInTasks = builtInTasks
         self.commandExecutor = commandExecutor
     }
 
     func run(_ task: AutomationTaskState, event: ApplicationTriggerEvent? = nil) throws {
-        try builtInTasks.ensureSupportFiles(for: task.configuration, paths: task.paths)
+        guard fileManager.fileExists(atPath: task.paths.scriptFile.path) else {
+            throw AutomationError.invalidConfiguration("\(task.configuration.name) needs a run.sh script in \(task.paths.taskDirectory.path).")
+        }
 
         let result = commandExecutor("/bin/zsh", try workerArguments(for: task, event: event))
         guard result.exitCode == 0 else {

@@ -31,7 +31,10 @@ struct TaskSnapshotLoader {
             }
         }
 
-        snapshot.codexUsage = CodexUsageSnapshot.load(summaryFile: paths.summaryFile, ledgerFile: paths.ledgerFile)
+        if fileManager.fileExists(atPath: paths.summaryFile.path) {
+            snapshot.codexUsage = CodexUsageSnapshot.load(summaryFile: paths.summaryFile, ledgerFile: paths.ledgerFile)
+        }
+
         return snapshot
     }
 }

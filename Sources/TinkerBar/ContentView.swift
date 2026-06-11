@@ -156,11 +156,12 @@ struct ContentView: View {
         return String(repeating: " ", count: width - value.count) + value
     }
 
+    private static let iso8601Formatter = ISO8601DateFormatter()
+
     private func formattedTimestamp(_ value: String) -> String {
         guard !value.isEmpty else { return "Never" }
 
-        let formatter = ISO8601DateFormatter()
-        guard let date = formatter.date(from: value) else { return value }
+        guard let date = Self.iso8601Formatter.date(from: value) else { return value }
 
         return date.formatted(date: .abbreviated, time: .shortened)
     }

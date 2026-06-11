@@ -287,35 +287,34 @@ final class AutomationRuntime: ObservableObject {
 
     func toggleLaunchAtLogin() {
         isBusy = true
+        let startupController = startupController
+        let enable = !launchAtLoginEnabled
 
         Task { [weak self] in
+            let result: Result<Void, any Error> = await Task.detached(priority: .userInitiated) {
+                do {
+                    if enable {
+                        try startupController.enable()
+                    } else {
+                        try startupController.disable()
+                    }
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+
             guard let self else { return }
 
-            defer {
-                Task { @MainActor in
-                    self.isBusy = false
-                }
+            switch result {
+            case .success:
+                self.launchAtLoginEnabled = enable
+                self.message = enable ? "Start at login enabled." : "Start at login disabled."
+            case .failure(let error):
+                self.message = error.localizedDescription
             }
 
-            do {
-                if self.launchAtLoginEnabled {
-                    try self.startupController.disable()
-                    await MainActor.run {
-                        self.launchAtLoginEnabled = false
-                        self.message = "Start at login disabled."
-                    }
-                } else {
-                    try self.startupController.enable()
-                    await MainActor.run {
-                        self.launchAtLoginEnabled = true
-                        self.message = "Start at login enabled."
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    self.message = error.localizedDescription
-                }
-            }
+            self.isBusy = false
         }
     }
 
@@ -323,7 +322,8 @@ final class AutomationRuntime: ObservableObject {
         isBusy = true
 
         do {
-            var loadedTasks = try catalog.discoverTasks()
+            let discovery = try catalog.discoverTasks()
+            var loadedTasks = discovery.tasks
             for index in loadedTasks.indices {
                 let id = loadedTasks[index].id
                 loadedTasks[index].isEnabled = enablementStore.isEnabled(id)
@@ -333,7 +333,9 @@ final class AutomationRuntime: ObservableObject {
             stopAllTaskScheduling()
             tasks = loadedTasks
             startEnabledTasks(using: startMode)
-            if startMode == .reload {
+            if !discovery.skippedFolders.isEmpty {
+                message = "Skipped invalid task folder(s): \(discovery.skippedFolders.joined(separator: ", "))"
+            } else if startMode == .reload {
                 message = "Tasks reloaded."
             }
         } catch {
@@ -586,7 +588,7 @@ final class AutomationRuntime: ObservableObject {
     ) -> DispatchSourceTimer {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(
-            deadline: .now() + dispatchInterval(for: firstDelay),
+            wallDeadline: .now() + dispatchInterval(for: firstDelay),
             repeating: dispatchInterval(for: repeatDelay),
             leeway: timerLeeway(for: repeatDelay)
         )
@@ -600,7 +602,7 @@ final class AutomationRuntime: ObservableObject {
     ) -> DispatchSourceTimer {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(
-            deadline: .now() + dispatchInterval(for: delay),
+            wallDeadline: .now() + dispatchInterval(for: delay),
             leeway: timerLeeway(for: delay)
         )
         timer.setEventHandler(handler: eventHandler)

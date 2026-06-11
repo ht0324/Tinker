@@ -14,7 +14,7 @@ enum StartupControllerError: LocalizedError {
     }
 }
 
-struct StartupController {
+struct StartupController: @unchecked Sendable {
     static let agentLabel = "com.huntae.tinkerbar.startup"
 
     private let fileManager = FileManager.default
@@ -71,12 +71,19 @@ struct StartupController {
             <array>
                 <string>/usr/bin/open</string>
                 <string>-gj</string>
-                <string>\(bundleURL.path)</string>
+                <string>\(xmlEscaped(bundleURL.path))</string>
             </array>
             <key>RunAtLoad</key>
             <true/>
         </dict>
         </plist>
         """
+    }
+
+    private func xmlEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 }

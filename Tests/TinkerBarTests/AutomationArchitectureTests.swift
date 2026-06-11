@@ -26,7 +26,7 @@ final class TaskCatalogTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
 
         let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory)
-        let tasks = try catalog.discoverTasks()
+        let tasks = try catalog.discoverTasks().tasks
 
         XCTAssertEqual(tasks.map(\.id), ["codex-usage-ledger", "codex-update", "heic-to-jpeg", "parsec-macmini-mirror"])
     }
@@ -43,12 +43,36 @@ final class TaskCatalogTests: XCTestCase {
         )
 
         let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false)
-        let tasks = try catalog.discoverTasks()
+        let tasks = try catalog.discoverTasks().tasks
 
         XCTAssertEqual(tasks.map(\.id), ["sample-interval"])
         XCTAssertEqual(tasks.first?.configuration.name, "Sample Interval")
         XCTAssertTrue(FileManager.default.fileExists(atPath: taskDirectory.statusFile.path))
         XCTAssertTrue(tasks.first?.snapshot.filesInstalled == true)
+    }
+
+    func testSkipsInvalidTaskFolderWithoutFailingDiscovery() throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        try writeTask(
+            id: "sample-interval",
+            name: "Sample Interval",
+            triggerKind: .interval,
+            appSupportDirectory: appSupportDirectory
+        )
+
+        let brokenDirectory = appSupportDirectory
+            .appendingPathComponent("tasks", isDirectory: true)
+            .appendingPathComponent("broken", isDirectory: true)
+        try FileManager.default.createDirectory(at: brokenDirectory, withIntermediateDirectories: true)
+        try Data("not json".utf8).write(to: brokenDirectory.appendingPathComponent("task.json"))
+
+        let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false)
+        let discovery = try catalog.discoverTasks()
+
+        XCTAssertEqual(discovery.tasks.map(\.id), ["sample-interval"])
+        XCTAssertEqual(discovery.skippedFolders, ["broken"])
     }
 }
 
@@ -133,11 +157,11 @@ final class CodexUsageSnapshotTests: XCTestCase {
 }
 
 final class DirectoryMonitorTests: XCTestCase {
-    func testMonitorNotifiesForNewRegularFilesOnly() async throws {
+    func testMonitorNotifiesForNewAndRenamedRegularFilesOnly() async throws {
         let watchedDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: watchedDirectory) }
 
-        let existingFile = watchedDirectory.appendingPathComponent("existing.heic")
+        let existingFile = watchedDirectory.appendingPathComponent("existing.crdownload")
         try Data("old".utf8).write(to: existingFile)
 
         let counter = EventCounter()
@@ -149,22 +173,22 @@ final class DirectoryMonitorTests: XCTestCase {
 
         let renamedFile = watchedDirectory.appendingPathComponent("renamed.heic")
         try FileManager.default.moveItem(at: existingFile, to: renamedFile)
-        let sawRenameEvent = await waitUntil(timeout: 0.4) {
-            counter.count > 0
+        let sawRenameEvent = await waitUntil(timeout: 2) {
+            counter.count == 1
         }
-        XCTAssertFalse(sawRenameEvent)
+        XCTAssertTrue(sawRenameEvent)
 
         let createdDirectory = watchedDirectory.appendingPathComponent("nested", isDirectory: true)
         try FileManager.default.createDirectory(at: createdDirectory, withIntermediateDirectories: true)
         let sawDirectoryEvent = await waitUntil(timeout: 0.4) {
-            counter.count > 0
+            counter.count > 1
         }
         XCTAssertFalse(sawDirectoryEvent)
 
         let createdFile = watchedDirectory.appendingPathComponent("created.heic")
         try Data("new".utf8).write(to: createdFile)
         let sawCreateEvent = await waitUntil(timeout: 2) {
-            counter.count == 1
+            counter.count == 2
         }
         XCTAssertTrue(sawCreateEvent)
     }

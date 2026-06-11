@@ -72,22 +72,21 @@ final class DirectoryMonitor: @unchecked Sendable {
     private func currentRegularFileIDs() -> Set<String> {
         let entryURLs = (try? fileManager.contentsOfDirectory(
             at: url,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )) ?? []
 
         return Set(entryURLs.compactMap { entryURL in
             guard
-                let resourceValues = try? entryURL.resourceValues(forKeys: [.isRegularFileKey]),
-                resourceValues.isRegularFile == true,
                 let attributes = try? fileManager.attributesOfItem(atPath: entryURL.path),
+                attributes[.type] as? FileAttributeType == .typeRegular,
                 let systemNumber = attributes[.systemNumber],
                 let fileNumber = attributes[.systemFileNumber]
             else {
                 return nil
             }
 
-            return "\(systemNumber):\(fileNumber)"
+            return "\(entryURL.lastPathComponent):\(systemNumber):\(fileNumber)"
         })
     }
 }
