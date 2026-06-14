@@ -16,11 +16,7 @@ struct TinkerBarApp: App {
     }
 
     private var menuBarTitle: String {
-        if showsTodaySpendingInMenuBar {
-            return runtime.codexUsageSnapshot?.todayMenuBarBadgeText ?? runtime.menuBarTitle
-        }
-
-        return runtime.menuBarTitle
+        runtime.menuBarTitle(showingTodaySpending: showsTodaySpendingInMenuBar)
     }
 
     private var menuBarSystemImage: String {

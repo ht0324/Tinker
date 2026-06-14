@@ -127,6 +127,7 @@ final class AutomationRuntime: ObservableObject {
     private let enablementStore: TaskEnablementStore
     private let quietHours: AutomationQuietHours
     private let dateProvider: () -> Date
+    private let snapshotLoader: @Sendable (AutomationTaskPaths) -> AutomationTaskSnapshot
 
     private var directoryMonitors: [String: DirectoryMonitor] = [:]
     private var applicationMonitors: [String: ApplicationMonitor] = [:]
@@ -135,6 +136,7 @@ final class AutomationRuntime: ObservableObject {
     private var quietHourDeferredRunTimers: [String: DispatchSourceTimer] = [:]
     private var runningTaskIDs: Set<String> = []
     private var coalescedRunSources: [String: TaskRunRequestSource] = [:]
+    private var refreshGeneration = 0
 
     private let codexUsageTaskID = "codex-usage-ledger"
 
@@ -146,6 +148,9 @@ final class AutomationRuntime: ObservableObject {
         enablementStore: TaskEnablementStore = TaskEnablementStore(),
         quietHours: AutomationQuietHours = .overnight,
         dateProvider: @escaping () -> Date = Date.init,
+        snapshotLoader: @escaping @Sendable (AutomationTaskPaths) -> AutomationTaskSnapshot = { paths in
+            TaskSnapshotLoader().snapshot(for: paths)
+        },
         autoload: Bool = true,
         loadStartupState: Bool = true
     ) {
@@ -156,6 +161,7 @@ final class AutomationRuntime: ObservableObject {
         self.enablementStore = enablementStore
         self.quietHours = quietHours
         self.dateProvider = dateProvider
+        self.snapshotLoader = snapshotLoader
 
         if loadStartupState {
             launchAtLoginEnabled = startupController.isEnabled()
@@ -183,8 +189,12 @@ final class AutomationRuntime: ObservableObject {
         tasks.first(where: { $0.id == codexUsageTaskID })?.snapshot.codexUsage
     }
 
-    var menuBarTitle: String {
-        codexUsageSnapshot?.menuBarBadgeText ?? "TinkerBar"
+    func menuBarTitle(showingTodaySpending: Bool) -> String {
+        if showingTodaySpending, let todayBadge = codexUsageSnapshot?.todayMenuBarBadgeText {
+            return todayBadge
+        }
+
+        return codexUsageSnapshot?.menuBarBadgeText ?? "TinkerBar"
     }
 
     var quietModeStatusText: String {
@@ -201,11 +211,35 @@ final class AutomationRuntime: ObservableObject {
     }
 
     func refresh() {
-        var refreshedTasks = tasks
-        for index in refreshedTasks.indices {
-            refreshedTasks[index].snapshot = catalog.snapshot(for: refreshedTasks[index].paths)
+        let identifiedPaths = tasks.map { (id: $0.id, paths: $0.paths) }
+        guard !identifiedPaths.isEmpty else { return }
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        let snapshotLoader = snapshotLoader
+
+        Task { [weak self] in
+            let snapshots = await Task.detached(priority: .utility) {
+                identifiedPaths.map { (id: $0.id, snapshot: snapshotLoader($0.paths)) }
+            }.value
+
+            guard let self else { return }
+            guard self.refreshGeneration == generation else { return }
+
+            // Apply by ID and publish once: a reload between dispatch and
+            // completion may have changed the task list out from under us.
+            let snapshotsByID = Dictionary(snapshots.map { ($0.id, $0.snapshot) }, uniquingKeysWith: { _, latest in latest })
+            var updatedTasks = self.tasks
+            var didChange = false
+            for index in updatedTasks.indices {
+                if let snapshot = snapshotsByID[updatedTasks[index].id] {
+                    updatedTasks[index].snapshot = snapshot
+                    didChange = true
+                }
+            }
+            if didChange {
+                self.tasks = updatedTasks
+            }
         }
-        tasks = refreshedTasks
     }
 
     func menuDidAppear() {
@@ -320,6 +354,7 @@ final class AutomationRuntime: ObservableObject {
 
     private func loadTasks(using startMode: TaskStartMode) {
         isBusy = true
+        invalidateInFlightRefreshes()
 
         do {
             let discovery = try catalog.discoverTasks()
@@ -493,6 +528,7 @@ final class AutomationRuntime: ObservableObject {
 
     private func finishTaskRun(_ taskID: String, source: TaskRunRequestSource, outcome: TaskRunOutcome) {
         runningTaskIDs.remove(taskID)
+        invalidateInFlightRefreshes()
         guard let refreshedIndex = indexOfTask(taskID) else {
             coalescedRunSources.removeValue(forKey: taskID)
             return
@@ -617,12 +653,14 @@ final class AutomationRuntime: ObservableObject {
         tasks.firstIndex(where: { $0.id == taskID })
     }
 
+    private func invalidateInFlightRefreshes() {
+        refreshGeneration += 1
+    }
+
     @discardableResult
     private func updateTask(at index: Int, _ update: (inout AutomationTaskState) -> Void) -> AutomationTaskState {
-        var updatedTasks = tasks
-        update(&updatedTasks[index])
-        tasks = updatedTasks
-        return updatedTasks[index]
+        update(&tasks[index])
+        return tasks[index]
     }
 
     private func task(_ taskID: String) -> AutomationTaskState? {

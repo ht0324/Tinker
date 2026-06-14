@@ -97,8 +97,7 @@ struct CodexUsageSnapshot: Sendable {
         let absoluteAmount = abs(amount)
 
         if absoluteAmount >= 1_000 {
-            let compact = String(format: "$%.1fk", amount / 1_000)
-            return compact.replacingOccurrences(of: ".0k", with: "k")
+            return "$" + compactThousands(amount)
         }
 
         if absoluteAmount >= 100 {
@@ -116,11 +115,14 @@ struct CodexUsageSnapshot: Sendable {
         let absoluteAmount = abs(amount)
 
         if absoluteAmount >= 1_000 {
-            let compact = String(format: "%.1fk", amount / 1_000)
-            return "\(compact.replacingOccurrences(of: ".0k", with: "k"))$"
+            return compactThousands(amount) + "$"
         }
 
         return "\(Int(amount.rounded()))$"
+    }
+
+    private static func compactThousands(_ amount: Double) -> String {
+        String(format: "%.1fk", amount / 1_000).replacingOccurrences(of: ".0k", with: "k")
     }
 
     static func load(summaryFile: URL, ledgerFile: URL) -> CodexUsageSnapshot? {

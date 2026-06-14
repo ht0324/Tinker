@@ -23,7 +23,7 @@ struct ContentView: View {
             ForEach(runtime.tasks) { task in
                 Menu(task.configuration.name) {
                     if let usage = task.snapshot.codexUsage {
-                        statusLine("Recorded \(usage.earliestRecordedDate) to \(usage.latestRecordedDate)")
+                        Text("Recorded \(usage.earliestRecordedDate) to \(usage.latestRecordedDate)")
                         usageTableLine(usageTableHeader())
                         usageTableLine(usageTableRow(
                             label: "Total",
@@ -41,19 +41,19 @@ struct ContentView: View {
                         Divider()
                     }
 
-                    statusLine(task.configuration.detail)
-                    statusLine("\(task.configuration.triggerDescription): \(task.configuration.triggerDetail)")
-                    statusLine("Task folder: \(task.paths.taskDirectory.lastPathComponent)")
-                    statusLine("Task ready: \(task.snapshot.filesInstalled ? "Yes" : "No")")
-                    statusLine("Last run: \(formattedTimestamp(task.snapshot.lastRunISO))")
-                    statusLine("Last success: \(formattedTimestamp(task.snapshot.lastSuccessISO))")
+                    Text(task.configuration.detail)
+                    Text("\(task.configuration.triggerDescription): \(task.configuration.triggerDetail)")
+                    Text("Task folder: \(task.paths.taskDirectory.lastPathComponent)")
+                    Text("Task ready: \(task.snapshot.filesInstalled ? "Yes" : "No")")
+                    Text("Last run: \(formattedTimestamp(task.snapshot.lastRunISO))")
+                    Text("Last success: \(formattedTimestamp(task.snapshot.lastSuccessISO))")
 
                     if !task.snapshot.lastOutput.isEmpty {
-                        statusLine("Last output: \(displayLastOutput(task.snapshot.lastOutput))")
+                        Text("Last output: \(displayLastOutput(task.snapshot.lastOutput))")
                     }
 
                     if !task.snapshot.lastError.isEmpty {
-                        statusLine("Last error: \(task.snapshot.lastError)")
+                        Text("Last error: \(task.snapshot.lastError)")
                     }
 
                     Divider()
@@ -112,10 +112,6 @@ struct ContentView: View {
         .onAppear {
             runtime.menuDidAppear()
         }
-    }
-
-    private func statusLine(_ value: String) -> some View {
-        Text(value)
     }
 
     private func usageTableLine(_ value: String) -> some View {

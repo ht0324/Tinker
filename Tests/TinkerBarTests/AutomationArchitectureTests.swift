@@ -543,6 +543,46 @@ final class AutomationRuntimeTests: XCTestCase {
         wait(for: [publishExpectation], timeout: 1)
         XCTAssertEqual(runtime.tasks.first?.snapshot.lastRunISO, expectedLastRun)
     }
+
+    @MainActor
+    func testRefreshIgnoresOlderResultsThatCompleteLate() async throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        try writeTask(
+            id: "usage",
+            name: "Usage",
+            triggerKind: .interval,
+            intervalSeconds: 60,
+            appSupportDirectory: appSupportDirectory
+        )
+
+        let loader = OrderedSnapshotLoader()
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+            snapshotLoader: loader.snapshot,
+            autoload: false,
+            loadStartupState: false
+        )
+        runtime.reloadTasks()
+
+        runtime.refresh()
+        let sawFirstRefresh = await loader.waitForCallCount(1)
+        XCTAssertTrue(sawFirstRefresh)
+
+        runtime.refresh()
+        let sawSecondRefresh = await loader.waitForCallCount(2)
+        XCTAssertTrue(sawSecondRefresh)
+        let appliedSecondRefresh = await waitUntilOnMainActor(timeout: 1) {
+            runtime.tasks.first?.snapshot.lastRunISO == "newer-refresh"
+        }
+        XCTAssertTrue(appliedSecondRefresh)
+
+        loader.unblockFirstCall()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(runtime.tasks.first?.snapshot.lastRunISO, "newer-refresh")
+    }
 }
 
 private struct CommandCall: Sendable {
@@ -643,7 +683,65 @@ private final class BlockingCommandExecutor: @unchecked Sendable {
     }
 }
 
+private final class OrderedSnapshotLoader: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var currentCallCount = 0
+    private var firstCallIsUnblocked = false
+
+    var callCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return currentCallCount
+    }
+
+    func snapshot(for paths: AutomationTaskPaths) -> AutomationTaskSnapshot {
+        condition.lock()
+        currentCallCount += 1
+        let callNumber = currentCallCount
+        condition.broadcast()
+
+        while callNumber == 1 && !firstCallIsUnblocked {
+            condition.wait()
+        }
+
+        condition.unlock()
+
+        var snapshot = AutomationTaskSnapshot()
+        snapshot.filesInstalled = true
+        snapshot.lastRunISO = callNumber == 1 ? "older-refresh" : "newer-refresh"
+        return snapshot
+    }
+
+    func unblockFirstCall() {
+        condition.lock()
+        firstCallIsUnblocked = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func waitForCallCount(_ expectedCount: Int, timeout: TimeInterval = 2) async -> Bool {
+        await waitUntil(timeout: timeout) {
+            self.callCount >= expectedCount
+        }
+    }
+}
+
 private func waitUntil(timeout: TimeInterval, condition: @escaping () -> Bool) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+
+    while Date() < deadline {
+        if condition() {
+            return true
+        }
+
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+
+    return condition()
+}
+
+@MainActor
+private func waitUntilOnMainActor(timeout: TimeInterval, condition: @escaping @MainActor () -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
 
     while Date() < deadline {
