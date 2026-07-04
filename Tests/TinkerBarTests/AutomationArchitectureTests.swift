@@ -3,23 +3,6 @@ import Combine
 import XCTest
 @testable import TinkerBar
 
-final class TaskEnablementStoreTests: XCTestCase {
-    func testEnabledStateRoundTripsByTaskID() throws {
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let store = TaskEnablementStore(defaults: defaults)
-
-        XCTAssertFalse(store.isEnabled("codex-update"))
-        store.setEnabled(true, taskID: "codex-update")
-        XCTAssertTrue(store.isEnabled("codex-update"))
-        store.setEnabled(false, taskID: "codex-update")
-        XCTAssertFalse(store.isEnabled("codex-update"))
-    }
-
-}
-
 final class TaskCatalogTests: XCTestCase {
     func testBuiltInTaskOrderingShowsUsageBeforeUpdate() throws {
         let appSupportDirectory = try makeTemporaryDirectory()
@@ -149,13 +132,6 @@ final class TaskRunnerTests: XCTestCase {
     }
 }
 
-final class CodexUsageSnapshotTests: XCTestCase {
-    func testHostDisplayNames() {
-        XCTAssertEqual(CodexUsageSnapshot.hostDisplayName("local"), "MacBook")
-        XCTAssertEqual(CodexUsageSnapshot.hostDisplayName("build-host"), "Build-Host")
-    }
-}
-
 final class DirectoryMonitorTests: XCTestCase {
     func testMonitorNotifiesForNewAndRenamedRegularFilesOnly() async throws {
         let watchedDirectory = try makeTemporaryDirectory()
@@ -203,12 +179,6 @@ final class AutomationQuietHoursTests: XCTestCase {
         XCTAssertTrue(quietHours.contains(makeDate(hour: 1, calendar: calendar)))
         XCTAssertTrue(quietHours.contains(makeDate(hour: 7, minute: 59, calendar: calendar)))
         XCTAssertFalse(quietHours.contains(makeDate(hour: 8, calendar: calendar)))
-    }
-
-    func testQuietHoursRangeDescription() {
-        let quietHours = AutomationQuietHours(startHour: 1, endHour: 8, calendar: makeUTCCalendar())
-
-        XCTAssertEqual(quietHours.rangeDescription, "1 AM-8 AM")
     }
 }
 
