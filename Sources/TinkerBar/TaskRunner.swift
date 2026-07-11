@@ -26,12 +26,11 @@ enum TaskRunOutcome: Sendable {
     }
 }
 
-final class TaskRunner: @unchecked Sendable {
+struct TaskRunner: @unchecked Sendable {
     typealias CommandExecutor = @Sendable (
         _ executable: String,
         _ arguments: [String],
-        _ timeout: TimeInterval,
-        _ cancellation: CommandCancellationToken
+        _ timeout: TimeInterval
     ) -> CommandResult
 
     typealias SnapshotLoader = @Sendable (AutomationTaskPaths) -> AutomationTaskSnapshot
@@ -40,8 +39,6 @@ final class TaskRunner: @unchecked Sendable {
     private let commandExecutor: CommandExecutor
     private let executionTimeout: TimeInterval
     private let snapshotLoader: SnapshotLoader
-    private let activeExecutionsLock = NSLock()
-    private var activeExecutions: [String: CommandCancellationToken] = [:]
 
     init(
         fileManager: FileManager = .default,
@@ -49,12 +46,11 @@ final class TaskRunner: @unchecked Sendable {
         snapshotLoader: @escaping SnapshotLoader = { paths in
             TaskSnapshotLoader().snapshot(for: paths)
         },
-        commandExecutor: @escaping CommandExecutor = { executable, arguments, timeout, cancellation in
+        commandExecutor: @escaping CommandExecutor = { executable, arguments, timeout in
             CommandRunner.run(
                 executable,
                 arguments: arguments,
-                timeout: timeout,
-                cancellation: cancellation
+                timeout: timeout
             )
         }
     ) {
@@ -65,24 +61,13 @@ final class TaskRunner: @unchecked Sendable {
     }
 
     func run(_ task: AutomationTaskState, event: ApplicationTriggerEvent? = nil) -> TaskRunOutcome {
-        let cancellation = CommandCancellationToken()
-        guard register(cancellation, taskID: task.id) else {
-            return .failure(
-                "\(task.configuration.name) is already running.",
-                snapshotLoader(task.paths)
-            )
-        }
-        defer { unregister(cancellation, taskID: task.id) }
-
         if Task.isCancelled {
-            cancellation.cancel()
             let message = "\(task.configuration.name) stopped before completion."
             return .cancelled(
-                snapshotPersistingRunnerError(
+                persistRunnerError(
                     message,
                     for: task,
-                    current: snapshotLoader(task.paths),
-                    overwriteExistingError: true
+                    current: snapshotLoader(task.paths)
                 )
             )
         }
@@ -98,8 +83,7 @@ final class TaskRunner: @unchecked Sendable {
             let result = commandExecutor(
                 "/bin/zsh",
                 try workerArguments(for: task, event: event),
-                executionTimeout,
-                cancellation
+                executionTimeout
             )
             let snapshot = snapshotLoader(task.paths)
             return outcome(
@@ -112,30 +96,12 @@ final class TaskRunner: @unchecked Sendable {
             let message = error.localizedDescription
             return .failure(
                 message,
-                snapshotPersistingRunnerError(
+                persistRunnerError(
                     message,
                     for: task,
-                    current: snapshotLoader(task.paths),
-                    overwriteExistingError: true
+                    current: snapshotLoader(task.paths)
                 )
             )
-        }
-    }
-
-    func cancel(_ taskID: String) {
-        activeExecutionsLock.lock()
-        let cancellation = activeExecutions[taskID]
-        activeExecutionsLock.unlock()
-        cancellation?.cancel()
-    }
-
-    func cancelAll() {
-        activeExecutionsLock.lock()
-        let cancellations = Array(activeExecutions.values)
-        activeExecutionsLock.unlock()
-
-        for cancellation in cancellations {
-            cancellation.cancel()
         }
     }
 
@@ -163,40 +129,23 @@ final class TaskRunner: @unchecked Sendable {
         case .cancelled:
             let message = "\(task.configuration.name) stopped before completion."
             return .cancelled(
-                snapshotPersistingRunnerError(
+                persistRunnerError(
                     message,
                     for: task,
-                    current: snapshot,
-                    overwriteExistingError: true
+                    current: snapshot
                 )
             )
         case .timedOut:
             let message = "\(task.configuration.name) timed out after \(formattedTimeout)."
             return .timedOut(
                 message,
-                snapshotPersistingRunnerError(
+                persistRunnerError(
                     message,
                     for: task,
-                    current: snapshot,
-                    overwriteExistingError: true
+                    current: snapshot
                 )
             )
-        case .launchFailed:
-            let message = diagnosticMessage(
-                commandResult: commandResult,
-                snapshotError: nil,
-                fallback: "\(task.configuration.name) could not start."
-            )
-            return .failure(
-                message,
-                snapshotPersistingRunnerError(
-                    message,
-                    for: task,
-                    current: snapshot,
-                    overwriteExistingError: true
-                )
-            )
-        case .exited:
+        case .completed:
             if commandResult.exitCode != 0 {
                 let currentWorkerError = workerErrorWrittenDuringRun(
                     startingSnapshot: startingSnapshot,
@@ -212,11 +161,10 @@ final class TaskRunner: @unchecked Sendable {
                 }
                 return .failure(
                     message,
-                    snapshotPersistingRunnerError(
+                    persistRunnerError(
                         message,
                         for: task,
-                        current: snapshot,
-                        overwriteExistingError: true
+                        current: snapshot
                     )
                 )
             }
@@ -267,16 +215,11 @@ final class TaskRunner: @unchecked Sendable {
         return currentError
     }
 
-    private func snapshotPersistingRunnerError(
+    private func persistRunnerError(
         _ message: String,
         for task: AutomationTaskState,
-        current snapshot: AutomationTaskSnapshot,
-        overwriteExistingError: Bool = false
+        current snapshot: AutomationTaskSnapshot
     ) -> AutomationTaskSnapshot {
-        if !overwriteExistingError, nonEmpty(snapshot.lastError) != nil {
-            return snapshot
-        }
-
         let sanitizedMessage = sanitizedStatusValue(message, maxLength: 512)
         var entries = statusEntries(at: task.paths.statusFile)
         setStatusValue(ISO8601DateFormatter().string(from: Date()), for: "last_run_iso", entries: &entries)
@@ -347,23 +290,6 @@ final class TaskRunner: @unchecked Sendable {
         }
 
         return roundedSeconds == 1 ? "1 second" : "\(roundedSeconds) seconds"
-    }
-
-    private func register(_ cancellation: CommandCancellationToken, taskID: String) -> Bool {
-        activeExecutionsLock.lock()
-        defer { activeExecutionsLock.unlock() }
-
-        guard activeExecutions[taskID] == nil else { return false }
-        activeExecutions[taskID] = cancellation
-        return true
-    }
-
-    private func unregister(_ cancellation: CommandCancellationToken, taskID: String) {
-        activeExecutionsLock.lock()
-        defer { activeExecutionsLock.unlock() }
-
-        guard activeExecutions[taskID] === cancellation else { return }
-        activeExecutions[taskID] = nil
     }
 
     private func workerArguments(for task: AutomationTaskState, event: ApplicationTriggerEvent?) throws -> [String] {

@@ -577,8 +577,7 @@ private final class CommandCapture: @unchecked Sendable {
     func execute(
         _ executable: String,
         _ arguments: [String],
-        _ timeout: TimeInterval,
-        _ cancellation: CommandCancellationToken
+        _ timeout: TimeInterval
     ) -> CommandResult {
         lock.lock()
         recordedCalls.append(CommandCall(executable: executable, arguments: arguments))
@@ -625,8 +624,7 @@ private final class BlockingCommandExecutor: @unchecked Sendable {
     func execute(
         _ executable: String,
         _ arguments: [String],
-        _ timeout: TimeInterval,
-        _ cancellation: CommandCancellationToken
+        _ timeout: TimeInterval
     ) -> CommandResult {
         condition.lock()
         currentCallCount += 1

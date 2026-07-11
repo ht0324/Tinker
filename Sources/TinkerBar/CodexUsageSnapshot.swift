@@ -43,13 +43,11 @@ struct CodexUsageSnapshot: Sendable {
     let latestByHost: [HostLatest]
     let recentDailyTotals: [DailyCost]
     let recentDailyByHost: [String: [DailyCost]]
-    let expectedHosts: [String]
     let historicalUnavailableHosts: Set<String>
     let todayUnavailableHosts: Set<String>
-    let collectionErrors: [String]
 
     var isPartial: Bool {
-        !historicalUnavailableHosts.isEmpty || !todayUnavailableHosts.isEmpty
+        !unavailableHosts.isEmpty
     }
 
     var unavailableHosts: Set<String> {
@@ -167,13 +165,8 @@ struct CodexUsageSnapshot: Sendable {
         let sortedDates = Array(aggregation.dates).sorted()
         let recentDates = Array(sortedDates.suffix(7))
         let hosts = orderedHosts(summary: summary, ledgerHosts: aggregation.hosts)
-        let expectedHosts = summary.collection?.expectedHosts ?? hosts
         let historicalUnavailableHosts = Set(summary.collection?.historicalFailedHosts ?? [])
-        let todayUnavailableHosts = Set(
-            summary.today?.unavailableHosts
-                ?? summary.collection?.todayFailedHosts
-                ?? []
-        )
+        let todayUnavailableHosts = Set(summary.today?.unavailableHosts ?? [])
 
         let recentDailyTotals = recentDates.map { date in
             DailyCost(date: date, costUSD: aggregation.dailyTotals[date, default: 0])
@@ -222,10 +215,8 @@ struct CodexUsageSnapshot: Sendable {
             },
             recentDailyTotals: recentDailyTotals,
             recentDailyByHost: recentDailyByHost,
-            expectedHosts: expectedHosts,
             historicalUnavailableHosts: historicalUnavailableHosts,
-            todayUnavailableHosts: todayUnavailableHosts,
-            collectionErrors: summary.collection?.errors ?? []
+            todayUnavailableHosts: todayUnavailableHosts
         )
     }
 
@@ -373,12 +364,8 @@ private struct HostTotals {
 
 private struct SummaryDocument: Decodable {
     struct Collection: Decodable {
-        let status: String
         let expectedHosts: [String]
-        let failedHosts: [String]
         let historicalFailedHosts: [String]
-        let todayFailedHosts: [String]
-        let errors: [String]
     }
 
     struct MonthToDate: Decodable {

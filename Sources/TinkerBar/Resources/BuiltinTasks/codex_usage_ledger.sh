@@ -112,25 +112,6 @@ run_with_timeout() {
       exec @cmd or die "exec failed: $!\n";
     }
 
-    my $stop_child_group = sub {
-      my ($exit_code) = @_;
-      kill "TERM", -$pid;
-      my $grace_deadline = time() + 0.25;
-      my $child_reaped = 0;
-      while (time() < $grace_deadline) {
-        if (!$child_reaped) {
-          my $done = waitpid($pid, WNOHANG);
-          $child_reaped = 1 if $done == $pid;
-        }
-        last if $child_reaped && !kill(0, -$pid);
-        select undef, undef, undef, 0.02;
-      }
-
-      kill "KILL", -$pid if kill(0, -$pid);
-      waitpid($pid, 0) unless $child_reaped;
-      exit $exit_code;
-    };
-
     my $deadline = time() + $timeout;
     while (1) {
       my $done = waitpid($pid, WNOHANG);
@@ -142,7 +123,11 @@ run_with_timeout() {
 
       if (time() >= $deadline) {
         warn "command timed out after ${timeout}s: @cmd\n";
-        $stop_child_group->(124);
+        kill "TERM", -$pid;
+        select undef, undef, undef, 1;
+        kill "KILL", -$pid;
+        waitpid($pid, 0);
+        exit 124;
       }
 
       select undef, undef, undef, 0.2;
@@ -347,16 +332,15 @@ write_summary() {
   local today_rows_file="$3"
   local today_date="$4"
   local yesterday_date="$5"
-  local configured_hosts_json historical_failed_hosts_json today_failed_hosts_json collection_errors_json summary_tmp
+  local configured_hosts_json historical_failed_hosts_json today_failed_hosts_json summary_tmp
 
   configured_hosts_json=$(printf '%s\n' "${CONFIGURED_HOSTS[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
   historical_failed_hosts_json=$(printf '%s\n' "${HISTORICAL_FAILED_HOSTS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
   today_failed_hosts_json=$(printf '%s\n' "${TODAY_FAILED_HOSTS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
-  collection_errors_json=$(printf '%s\n' "${COLLECTION_ERRORS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')
 
   summary_tmp="${SUMMARY_FILE}.tmp"
   TEMP_FILES+=("$summary_tmp")
-  jq -s --slurpfile todayRows "$today_rows_file" --arg generatedAt "$generated_at" --arg timezone "$TIMEZONE" --arg monthStart "$month_start" --arg todayDate "$today_date" --arg yesterdayDate "$yesterday_date" --argjson configuredHosts "$configured_hosts_json" --argjson historicalFailedHosts "$historical_failed_hosts_json" --argjson todayFailedHosts "$today_failed_hosts_json" --argjson collectionErrors "$collection_errors_json" '
+  jq -s --slurpfile todayRows "$today_rows_file" --arg generatedAt "$generated_at" --arg timezone "$TIMEZONE" --arg monthStart "$month_start" --arg todayDate "$today_date" --arg yesterdayDate "$yesterday_date" --argjson configuredHosts "$configured_hosts_json" --argjson historicalFailedHosts "$historical_failed_hosts_json" --argjson todayFailedHosts "$today_failed_hosts_json" '
     def by_host(rows):
       (rows
         | sort_by(.host)
@@ -386,12 +370,9 @@ write_summary() {
       rows: length,
       latestRecordedDate: (map(.date) | max // ""),
       collection: {
-        status: (if (($historicalFailedHosts | length) + ($todayFailedHosts | length)) > 0 then "partial" else "complete" end),
         expectedHosts: $configuredHosts,
-        failedHosts: (($historicalFailedHosts + $todayFailedHosts) | unique),
         historicalFailedHosts: $historicalFailedHosts,
-        todayFailedHosts: $todayFailedHosts,
-        errors: $collectionErrors
+        todayFailedHosts: $todayFailedHosts
       },
       monthToDate: {
         since: $monthStart,

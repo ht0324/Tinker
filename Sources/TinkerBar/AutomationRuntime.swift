@@ -4,13 +4,10 @@ import SwiftUI
 
 enum AutomationError: LocalizedError {
     case invalidConfiguration(String)
-    case commandFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidConfiguration(let message):
-            return message
-        case .commandFailed(let message):
             return message
         }
     }
@@ -134,8 +131,7 @@ final class AutomationRuntime: ObservableObject {
     private var pendingRunTasks: [String: Task<Void, Never>] = [:]
     private var intervalTimers: [String: DispatchSourceTimer] = [:]
     private var quietHourDeferredRunTimers: [String: DispatchSourceTimer] = [:]
-    private var runningTaskIDs: Set<String> = []
-    private var runningTaskExecutions: [String: ActiveTaskExecution] = [:]
+    private var runningTaskExecutions: [String: Task<TaskRunOutcome, Never>] = [:]
     private var coalescedRunSources: [String: TaskRunRequestSource] = [:]
     private var refreshGeneration = 0
 
@@ -281,10 +277,9 @@ final class AutomationRuntime: ObservableObject {
     }
 
     func cancelTaskRun(_ taskID: String) {
-        guard runningTaskIDs.contains(taskID) else { return }
+        guard let execution = runningTaskExecutions[taskID] else { return }
 
-        runningTaskExecutions[taskID]?.task.cancel()
-        runner.cancel(taskID)
+        execution.cancel()
         coalescedRunSources.removeValue(forKey: taskID)
 
         if let task = task(taskID) {
@@ -295,25 +290,24 @@ final class AutomationRuntime: ObservableObject {
     func cancelAllTaskRuns() async {
         let executions = Array(runningTaskExecutions.values)
         for execution in executions {
-            execution.task.cancel()
+            execution.cancel()
         }
-        runner.cancelAll()
         coalescedRunSources.removeAll()
 
         for execution in executions {
-            _ = await execution.task.value
+            _ = await execution.value
         }
     }
 
     func requestTaskRun(_ taskID: String, source: TaskRunRequestSource) {
-        guard let index = indexOfTask(taskID) else { return }
+        guard indexOfTask(taskID) != nil else { return }
 
         if shouldDeferForQuietHours(source: source) {
             deferTaskRunUntilQuietHoursEnd(taskID, source: source)
             return
         }
 
-        if tasks[index].isRunning {
+        if runningTaskExecutions[taskID] != nil {
             switch source {
             case .directory, .application:
                 coalescedRunSources[taskID] = source
@@ -388,7 +382,7 @@ final class AutomationRuntime: ObservableObject {
             for index in loadedTasks.indices {
                 let id = loadedTasks[index].id
                 loadedTasks[index].isEnabled = enablementStore.isEnabled(id)
-                loadedTasks[index].isRunning = runningTaskIDs.contains(id)
+                loadedTasks[index].isRunning = runningTaskExecutions[id] != nil
             }
 
             stopAllTaskScheduling()
@@ -523,35 +517,35 @@ final class AutomationRuntime: ObservableObject {
     }
 
     private func startTaskRun(_ taskID: String, source: TaskRunRequestSource) {
-        guard let index = indexOfTask(taskID) else { return }
+        guard
+            let index = indexOfTask(taskID),
+            runningTaskExecutions[taskID] == nil
+        else {
+            return
+        }
 
         let task = tasks[index]
-        runningTaskIDs.insert(taskID)
         updateTask(at: index) { task in
             task.isRunning = true
         }
 
-        let executionID = UUID()
         let execution = Task.detached(priority: .utility) { [runner, task, source] in
             runner.run(task, event: source.applicationEvent)
         }
-        runningTaskExecutions[taskID] = ActiveTaskExecution(id: executionID, task: execution)
+        runningTaskExecutions[taskID] = execution
 
-        Task { [weak self, execution, executionID, taskID, source] in
+        Task { [weak self, execution, taskID, source] in
             let outcome = await execution.value
-            self?.finishTaskRun(taskID, executionID: executionID, source: source, outcome: outcome)
+            self?.finishTaskRun(taskID, source: source, outcome: outcome)
         }
     }
 
     private func finishTaskRun(
         _ taskID: String,
-        executionID: UUID,
         source: TaskRunRequestSource,
         outcome: TaskRunOutcome
     ) {
-        guard runningTaskExecutions[taskID]?.id == executionID else { return }
-        runningTaskExecutions.removeValue(forKey: taskID)
-        runningTaskIDs.remove(taskID)
+        guard runningTaskExecutions.removeValue(forKey: taskID) != nil else { return }
         invalidateInFlightRefreshes()
         guard let refreshedIndex = indexOfTask(taskID) else {
             coalescedRunSources.removeValue(forKey: taskID)
@@ -720,11 +714,6 @@ final class AutomationRuntime: ObservableObject {
     private struct IntervalLaunchPlan {
         let initialDelaySeconds: Double
         let shouldRunWhenReady: Bool
-    }
-
-    private struct ActiveTaskExecution {
-        let id: UUID
-        let task: Task<TaskRunOutcome, Never>
     }
 
     private static let iso8601Formatter = ISO8601DateFormatter()

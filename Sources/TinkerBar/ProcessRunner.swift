@@ -2,8 +2,7 @@ import Darwin
 import Foundation
 
 enum CommandTermination: Equatable, Sendable {
-    case exited
-    case launchFailed
+    case completed
     case timedOut
     case cancelled
 }
@@ -18,29 +17,12 @@ struct CommandResult: Sendable {
         exitCode: Int32,
         stdout: String,
         stderr: String,
-        termination: CommandTermination = .exited
+        termination: CommandTermination = .completed
     ) {
         self.exitCode = exitCode
         self.stdout = stdout
         self.stderr = stderr
         self.termination = termination
-    }
-}
-
-final class CommandCancellationToken: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cancelled = false
-
-    var isCancelled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cancelled
-    }
-
-    func cancel() {
-        lock.lock()
-        cancelled = true
-        lock.unlock()
     }
 }
 
@@ -53,7 +35,6 @@ enum CommandRunner {
         _ executable: String,
         arguments: [String],
         timeout: TimeInterval = defaultTimeout,
-        cancellation: CommandCancellationToken = CommandCancellationToken(),
         outputLimit: Int = defaultOutputLimit
     ) -> CommandResult {
         let stdoutPipe = Pipe()
@@ -71,7 +52,8 @@ enum CommandRunner {
             stdoutPipe: stdoutPipe,
             stderrPipe: stderrPipe
         )
-        closeWriteEnds(stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
+        stdoutPipe.fileHandleForWriting.closeFile()
+        stderrPipe.fileHandleForWriting.closeFile()
 
         guard case .success(let processID) = spawnResult else {
             drainOutput(stdoutPipe: stdoutPipe, stderrPipe: stderrPipe, group: outputGroup)
@@ -81,15 +63,13 @@ enum CommandRunner {
             return CommandResult(
                 exitCode: 1,
                 stdout: "",
-                stderr: message,
-                termination: .launchFailed
+                stderr: message
             )
         }
 
         let waitResult = waitForExit(
             processID: processID,
-            timeout: timeout,
-            cancellation: cancellation
+            timeout: timeout
         )
         drainOutput(stdoutPipe: stdoutPipe, stderrPipe: stderrPipe, group: outputGroup)
 
@@ -183,8 +163,7 @@ enum CommandRunner {
 
     private static func waitForExit(
         processID: pid_t,
-        timeout: TimeInterval,
-        cancellation: CommandCancellationToken
+        timeout: TimeInterval
     ) -> ProcessWaitResult {
         let boundedTimeout = min(max(timeout, 0), 365 * 24 * 60 * 60)
         let timeoutNanoseconds = UInt64(boundedTimeout * 1_000_000_000)
@@ -196,7 +175,7 @@ enum CommandRunner {
             if waitResult == processID {
                 return ProcessWaitResult(
                     exitCode: exitCode(from: waitStatus),
-                    termination: .exited,
+                    termination: .completed,
                     error: nil
                 )
             }
@@ -204,12 +183,12 @@ enum CommandRunner {
             if waitResult == -1, errno != EINTR {
                 return ProcessWaitResult(
                     exitCode: 1,
-                    termination: .exited,
+                    termination: .completed,
                     error: "Could not wait for command: \(errorMessage(code: errno))"
                 )
             }
 
-            if cancellation.isCancelled || Task.isCancelled {
+            if Task.isCancelled {
                 return terminateAndWait(
                     processID: processID,
                     termination: .cancelled
@@ -308,11 +287,6 @@ enum CommandRunner {
         return optionalPointers.withUnsafeMutableBufferPointer { buffer in
             body(buffer.baseAddress!)
         }
-    }
-
-    private static func closeWriteEnds(stdoutPipe: Pipe, stderrPipe: Pipe) {
-        stdoutPipe.fileHandleForWriting.closeFile()
-        stderrPipe.fileHandleForWriting.closeFile()
     }
 
     private static func drainOutput(stdoutPipe: Pipe, stderrPipe: Pipe, group: DispatchGroup) {

@@ -3,6 +3,14 @@ import Foundation
 import XCTest
 @testable import TinkerBar
 
+private let staleWorkerStatus = """
+last_run_iso\t2026-01-01T00:00:00Z
+last_success_iso\t
+success_count\t0
+last_output\t
+last_error\tstale worker failure
+"""
+
 final class TaskRunnerReliabilityTests: XCTestCase {
     func testExitZeroWithWorkerErrorReturnsFailure() throws {
         let fixture = try makeTaskFixture(
@@ -16,7 +24,7 @@ final class TaskRunnerReliabilityTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-        let runner = TaskRunner(commandExecutor: { _, _, _, _ in
+        let runner = TaskRunner(commandExecutor: { _, _, _ in
             CommandResult(exitCode: 0, stdout: "", stderr: "")
         })
 
@@ -41,7 +49,7 @@ final class TaskRunnerReliabilityTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-        let runner = TaskRunner(commandExecutor: { _, _, _, _ in
+        let runner = TaskRunner(commandExecutor: { _, _, _ in
             CommandResult(exitCode: 7, stdout: "", stderr: "")
         })
 
@@ -59,17 +67,11 @@ final class TaskRunnerReliabilityTests: XCTestCase {
 
     func testNonzeroExitReplacesStaleErrorWithCurrentDiagnostic() throws {
         let fixture = try makeTaskFixture(
-            status: """
-            last_run_iso\t2026-01-01T00:00:00Z
-            last_success_iso\t
-            success_count\t0
-            last_output\t
-            last_error\tstale worker failure
-            """
+            status: staleWorkerStatus
         )
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-        let runner = TaskRunner(commandExecutor: { _, _, _, _ in
+        let runner = TaskRunner(commandExecutor: { _, _, _ in
             CommandResult(exitCode: 7, stdout: "", stderr: "fresh process failure")
         })
 
@@ -98,13 +100,7 @@ final class TaskRunnerReliabilityTests: XCTestCase {
     func testTimeoutStopsWorkerProcessGroupAndPersistsError() throws {
         let fixture = try makeTaskFixture(
             script: sleepingWorkerScript,
-            status: """
-            last_run_iso\t2026-01-01T00:00:00Z
-            last_success_iso\t
-            success_count\t0
-            last_output\t
-            last_error\tstale worker failure
-            """
+            status: staleWorkerStatus
         )
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -135,13 +131,7 @@ final class TaskRunnerReliabilityTests: XCTestCase {
     func testCancellationStopsWorkerProcessGroup() async throws {
         let fixture = try makeTaskFixture(
             script: sleepingWorkerScript,
-            status: """
-            last_run_iso\t2026-01-01T00:00:00Z
-            last_success_iso\t
-            success_count\t0
-            last_output\t
-            last_error\tstale worker failure
-            """
+            status: staleWorkerStatus
         )
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -156,7 +146,7 @@ final class TaskRunnerReliabilityTests: XCTestCase {
         }
         XCTAssertTrue(workerStarted)
 
-        runner.cancel(fixture.task.id)
+        execution.cancel()
         let outcome = await execution.value
 
         guard case .cancelled(let snapshot) = outcome else {
@@ -180,39 +170,10 @@ final class TaskRunnerReliabilityTests: XCTestCase {
             outputLimit: 128
         )
 
-        XCTAssertEqual(result.termination, .exited)
+        XCTAssertEqual(result.termination, .completed)
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertLessThanOrEqual(result.stdout.utf8.count, 128)
         XCTAssertTrue(result.stdout.hasSuffix("TAIL\n"))
-    }
-
-    func testLaunchFailureReplacesStaleWorkerError() throws {
-        let fixture = try makeTaskFixture(
-            status: """
-            last_run_iso\t2026-01-01T00:00:00Z
-            last_success_iso\t
-            success_count\t0
-            last_output\t
-            last_error\tstale worker failure
-            """
-        )
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-        let runner = TaskRunner(commandExecutor: { _, _, _, _ in
-            CommandResult(
-                exitCode: 1,
-                stdout: "",
-                stderr: "fresh launch failure",
-                termination: .launchFailed
-            )
-        })
-
-        guard case .failure(let message, let snapshot) = runner.run(fixture.task) else {
-            return XCTFail("Expected launch failure")
-        }
-
-        XCTAssertEqual(message, "fresh launch failure")
-        XCTAssertEqual(snapshot.lastError, "fresh launch failure")
     }
 
     private var sleepingWorkerScript: String {
@@ -273,8 +234,8 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         let summary = try XCTUnwrap(JSONSerialization.jsonObject(with: summaryData) as? [String: Any])
         let collection = try XCTUnwrap(summary["collection"] as? [String: Any])
         let log = try String(contentsOf: usageTask.paths.logFile, encoding: .utf8)
-        XCTAssertEqual(collection["status"] as? String, "partial")
-        XCTAssertEqual(Set(collection["failedHosts"] as? [String] ?? []), Set(["offline"]), log)
+        XCTAssertEqual(Set(collection["historicalFailedHosts"] as? [String] ?? []), Set(["offline"]), log)
+        XCTAssertEqual(Set(collection["todayFailedHosts"] as? [String] ?? []), Set(["offline"]), log)
 
         let today = try XCTUnwrap(summary["today"] as? [String: Any])
         let todayHosts = Set((today["byHost"] as? [[String: Any]] ?? []).compactMap { $0["host"] as? String })
@@ -356,7 +317,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
 
         let processIDs = try readProcessIDs(from: processIDsFile)
         XCTAssertEqual(processIDs.count, 2)
-        runner.cancel(usageTask.id)
+        execution.cancel()
 
         guard case .cancelled = await execution.value else {
             return XCTFail("Expected usage collection to be cancelled")
@@ -458,14 +419,13 @@ private final class CancellationAwareExecutor: @unchecked Sendable {
     func execute(
         _ executable: String,
         _ arguments: [String],
-        _ timeout: TimeInterval,
-        _ cancellation: CommandCancellationToken
+        _ timeout: TimeInterval
     ) -> CommandResult {
         lock.lock()
         calls += 1
         lock.unlock()
 
-        while !cancellation.isCancelled {
+        while !Task.isCancelled {
             Thread.sleep(forTimeInterval: 0.01)
         }
 
