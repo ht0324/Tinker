@@ -254,9 +254,13 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
                 ledgerFile: usageTask.paths.ledgerFile
             )
         )
-        XCTAssertTrue(snapshot.isPartial)
-        XCTAssertEqual(snapshot.todayUnavailableHosts, Set(["offline"]))
-        XCTAssertTrue(snapshot.formattedTodayTotal.hasPrefix("≥"))
+        XCTAssertEqual(snapshot.partialDataText, "Partial data; unavailable: Offline")
+        XCTAssertEqual(snapshot.totalRow.today, "≥$4")
+        let offlineRow = try XCTUnwrap(snapshot.hostRows.first(where: { $0.id == "offline" }))
+        XCTAssertEqual(offlineRow.allTime, "≥$0")
+        XCTAssertEqual(offlineRow.monthToDate, "≥$0")
+        XCTAssertEqual(offlineRow.yesterday, "—")
+        XCTAssertEqual(offlineRow.today, "—")
 
         let status = try String(contentsOf: usageTask.paths.statusFile, encoding: .utf8)
         XCTAssertTrue(status.contains("last_error\tFailed to collect offline usage"))

@@ -10,9 +10,9 @@ struct ContentView: View {
             Text(runtime.summaryText)
 
             if let usage = runtime.codexUsageSnapshot {
-                Text("Codex \(usage.formattedTodayTotal) today")
+                Text("Codex \(usage.totalRow.today) today")
 
-                Text("All time \(usage.formattedAllTimeTotal)")
+                Text("All time \(usage.totalRow.allTime)")
             }
 
             Text(runtime.quietModeStatusText)
@@ -23,22 +23,15 @@ struct ContentView: View {
             ForEach(runtime.tasks) { task in
                 Menu(task.configuration.name) {
                     if let usage = task.snapshot.codexUsage {
-                        Text("Recorded \(usage.earliestRecordedDate) to \(usage.latestRecordedDate)")
-                        if usage.isPartial {
-                            Text("Partial data; unavailable: \(unavailableHostsDescription(usage))")
+                        Text(usage.recordedPeriodText)
+                        if let partialDataText = usage.partialDataText {
+                            Text(partialDataText)
                         }
                         usageTableLine(usageTableHeader())
-                        usageTableLine(usageTableRow(
-                            label: "Total",
-                            allTime: usage.formattedAllTimeTotal,
-                            monthToDate: usage.formattedMonthToDateTotal,
-                            yesterday: usage.formattedYesterdayTotal,
-                            today: usage.formattedTodayTotal,
-                            sparkline: usage.totalSparkline
-                        ))
+                        usageTableLine(usageTableRow(usage.totalRow))
 
-                        ForEach(usage.orderedAllTimeHostSummaries) { host in
-                            usageTableLine(usageHostTableRow(for: host, usage: usage))
+                        ForEach(usage.hostRows) { row in
+                            usageTableLine(usageTableRow(row))
                         }
 
                         Divider()
@@ -135,31 +128,15 @@ struct ContentView: View {
         usageTableRow(label: "Host", allTime: "All time", monthToDate: "MTD", yesterday: "Yday", today: "Today", sparkline: "7d")
     }
 
-    private func usageHostTableRow(for host: CodexUsageSnapshot.HostSummary, usage: CodexUsageSnapshot) -> String {
-        let monthToDate = usage.monthToDateByHost.first { $0.host == host.host }?.totalCostUSD ?? 0
-        let yesterday = usage.yesterdayByHost.first { $0.host == host.host }?.costUSD ?? 0
-        let today = usage.todayByHost.first { $0.host == host.host }?.costUSD ?? 0
-        let hasHistoricalGap = usage.hasHistoricalGap(for: host.host)
-
-        return usageTableRow(
-            label: CodexUsageSnapshot.hostDisplayName(host.host),
-            allTime: lowerBoundCurrency(host.totalCostUSD, hasGap: hasHistoricalGap),
-            monthToDate: lowerBoundCurrency(monthToDate, hasGap: hasHistoricalGap),
-            yesterday: hasHistoricalGap ? "—" : CodexUsageSnapshot.wholeCurrency(yesterday),
-            today: usage.hasTodayGap(for: host.host) ? "—" : CodexUsageSnapshot.wholeCurrency(today),
-            sparkline: usage.sparkline(for: host.host)
+    private func usageTableRow(_ row: CodexUsageSnapshot.Row) -> String {
+        usageTableRow(
+            label: row.label,
+            allTime: row.allTime,
+            monthToDate: row.monthToDate,
+            yesterday: row.yesterday,
+            today: row.today,
+            sparkline: row.sparkline
         )
-    }
-
-    private func lowerBoundCurrency(_ amount: Double, hasGap: Bool) -> String {
-        (hasGap ? "≥" : "") + CodexUsageSnapshot.wholeCurrency(amount)
-    }
-
-    private func unavailableHostsDescription(_ usage: CodexUsageSnapshot) -> String {
-        usage.unavailableHosts
-            .map(CodexUsageSnapshot.hostDisplayName)
-            .sorted()
-            .joined(separator: ", ")
     }
 
     private func usageTableRow(label: String, allTime: String, monthToDate: String, yesterday: String, today: String, sparkline: String) -> String {

@@ -1,151 +1,22 @@
 import Foundation
 
 struct CodexUsageSnapshot: Sendable {
-    struct HostSummary: Identifiable, Hashable, Sendable {
-        let host: String
-        let rows: Int
-        let totalCostUSD: Double
-        let latestDate: String
-
-        var id: String { host }
+    struct Row: Identifiable, Equatable, Sendable {
+        let id: String
+        let label: String
+        let allTime: String
+        let monthToDate: String
+        let yesterday: String
+        let today: String
+        let sparkline: String
     }
 
-    struct HostLatest: Identifiable, Hashable, Sendable {
-        let host: String
-        let date: String
-        let costUSD: Double
-        let totalTokens: Int
-
-        var id: String { host }
-    }
-
-    struct DailyCost: Identifiable, Hashable, Sendable {
-        let date: String
-        let costUSD: Double
-
-        var id: String { date }
-    }
-
-    let generatedAt: String
-    let timezone: String
-    let earliestRecordedDate: String
-    let latestRecordedDate: String
-    let allTimeTotalUSD: Double
-    let allTimeByHost: [HostSummary]
-    let monthToDateTotalUSD: Double
-    let monthToDateByHost: [HostSummary]
-    let yesterdayDate: String
-    let yesterdayTotalUSD: Double
-    let yesterdayByHost: [HostLatest]
-    let todayDate: String
-    let todayTotalUSD: Double
-    let todayByHost: [HostLatest]
-    let latestByHost: [HostLatest]
-    let recentDailyTotals: [DailyCost]
-    let recentDailyByHost: [String: [DailyCost]]
-    let historicalUnavailableHosts: Set<String>
-    let todayUnavailableHosts: Set<String>
-
-    var isPartial: Bool {
-        !unavailableHosts.isEmpty
-    }
-
-    var unavailableHosts: Set<String> {
-        historicalUnavailableHosts.union(todayUnavailableHosts)
-    }
-
-    var menuBarBadgeText: String {
-        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.compactCurrency(monthToDateTotalUSD)
-    }
-
-    var todayMenuBarBadgeText: String {
-        partialPrefix(hasGaps: !todayUnavailableHosts.isEmpty) + Self.trailingDollarCompactCurrency(todayTotalUSD)
-    }
-
-    var formattedMonthToDateTotal: String {
-        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.wholeCurrency(monthToDateTotalUSD)
-    }
-
-    var formattedAllTimeTotal: String {
-        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.wholeCurrency(allTimeTotalUSD)
-    }
-
-    var formattedYesterdayTotal: String {
-        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.wholeCurrency(yesterdayTotalUSD)
-    }
-
-    var formattedTodayTotal: String {
-        partialPrefix(hasGaps: !todayUnavailableHosts.isEmpty) + Self.wholeCurrency(todayTotalUSD)
-    }
-
-    var totalSparkline: String {
-        Self.sparkline(for: recentDailyTotals.map(\.costUSD))
-    }
-
-    var orderedAllTimeHostSummaries: [HostSummary] {
-        allTimeByHost.sorted { Self.hostSortKey($0.host) < Self.hostSortKey($1.host) }
-    }
-
-    func sparkline(for host: String) -> String {
-        Self.sparkline(for: recentDailyByHost[host, default: []].map(\.costUSD))
-    }
-
-    func hasHistoricalGap(for host: String) -> Bool {
-        historicalUnavailableHosts.contains(host)
-    }
-
-    func hasTodayGap(for host: String) -> Bool {
-        todayUnavailableHosts.contains(host)
-    }
-
-    static func hostDisplayName(_ host: String) -> String {
-        switch host {
-        case "local":
-            return "MacBook"
-        default:
-            return host.capitalized
-        }
-    }
-
-    static func wholeCurrency(_ amount: Double) -> String {
-        wholeCurrencyFormatter.string(from: NSNumber(value: amount)) ?? "$\(Int(amount.rounded()))"
-    }
-
-    static func compactCurrency(_ amount: Double) -> String {
-        let absoluteAmount = abs(amount)
-
-        if absoluteAmount >= 1_000 {
-            return "$" + compactThousands(amount)
-        }
-
-        if absoluteAmount >= 100 {
-            return "$\(Int(amount.rounded()))"
-        }
-
-        if absoluteAmount >= 10 {
-            return String(format: "$%.1f", amount)
-        }
-
-        return String(format: "$%.2f", amount)
-    }
-
-    static func trailingDollarCompactCurrency(_ amount: Double) -> String {
-        let absoluteAmount = abs(amount)
-
-        if absoluteAmount >= 1_000 {
-            return compactThousands(amount) + "$"
-        }
-
-        return "\(Int(amount.rounded()))$"
-    }
-
-    private static func compactThousands(_ amount: Double) -> String {
-        String(format: "%.1fk", amount / 1_000).replacingOccurrences(of: ".0k", with: "k")
-    }
-
-    private func partialPrefix(hasGaps: Bool) -> String {
-        hasGaps ? "≥" : ""
-    }
+    let recordedPeriodText: String
+    let partialDataText: String?
+    let totalRow: Row
+    let hostRows: [Row]
+    let menuBarBadgeText: String
+    let todayMenuBarBadgeText: String
 
     static func load(summaryFile: URL, ledgerFile: URL) -> CodexUsageSnapshot? {
         CodexUsageSnapshotCache.shared.load(summaryFile: summaryFile, ledgerFile: ledgerFile) {
@@ -168,55 +39,57 @@ struct CodexUsageSnapshot: Sendable {
         let historicalUnavailableHosts = Set(summary.collection?.historicalFailedHosts ?? [])
         let todayUnavailableHosts = Set(summary.today?.unavailableHosts ?? [])
 
-        let recentDailyTotals = recentDates.map { date in
-            DailyCost(date: date, costUSD: aggregation.dailyTotals[date, default: 0])
-        }
+        let recentDailyTotals = recentDates.map { aggregation.dailyTotals[$0, default: 0] }
 
-        var recentDailyByHost: [String: [DailyCost]] = [:]
+        var recentDailyByHost: [String: [Double]] = [:]
         for host in hosts {
             let dateTotals = aggregation.dailyTotalsByHost[host, default: [:]]
-            recentDailyByHost[host] = recentDates.map { date in
-                DailyCost(date: date, costUSD: dateTotals[date, default: 0])
-            }
+            recentDailyByHost[host] = recentDates.map { dateTotals[$0, default: 0] }
         }
 
         let allTimeByHost = hosts.map { host in
             let totals = aggregation.hostTotals[host] ?? HostTotals()
-            return HostSummary(
-                host: host,
-                rows: totals.rows,
-                totalCostUSD: totals.totalCostUSD,
-                latestDate: totals.latestDate
-            )
+            return HostCost(host: host, costUSD: totals.totalCostUSD)
+        }
+        let monthToDateByHost = summary.monthToDate.byHost.map {
+            HostCost(host: $0.host, costUSD: $0.totalCostUSD)
         }
         let yesterday = resolvedYesterday(summary: summary, aggregation: aggregation, hosts: hosts)
+        let todayByHost = summary.today?.byHost.map {
+            HostCost(host: $0.host, costUSD: $0.costUSD)
+        } ?? []
+        let earliestRecordedDate = aggregation.earliestRecordedDate ?? summary.latestRecordedDate
+        let todayTotalUSD = summary.today?.totalCostUSD ?? 0
+        let hasHistoricalGaps = !historicalUnavailableHosts.isEmpty
+        let hasTodayGaps = !todayUnavailableHosts.isEmpty
 
         return CodexUsageSnapshot(
-            generatedAt: summary.generatedAt,
-            timezone: summary.timezone,
-            earliestRecordedDate: aggregation.earliestRecordedDate ?? summary.latestRecordedDate,
-            latestRecordedDate: summary.latestRecordedDate,
-            allTimeTotalUSD: aggregation.allTimeTotalUSD,
-            allTimeByHost: allTimeByHost,
-            monthToDateTotalUSD: summary.monthToDate.totalCostUSD,
-            monthToDateByHost: summary.monthToDate.byHost.map {
-                HostSummary(host: $0.host, rows: $0.rows, totalCostUSD: $0.totalCostUSD, latestDate: $0.latestDate)
-            },
-            yesterdayDate: yesterday.date,
-            yesterdayTotalUSD: yesterday.totalUSD,
-            yesterdayByHost: yesterday.byHost,
-            todayDate: summary.today?.date ?? "",
-            todayTotalUSD: summary.today?.totalCostUSD ?? 0,
-            todayByHost: summary.today?.byHost.map {
-                HostLatest(host: $0.host, date: $0.date, costUSD: $0.costUSD, totalTokens: $0.totalTokens)
-            } ?? [],
-            latestByHost: summary.latestByHost.map {
-                HostLatest(host: $0.host, date: $0.date, costUSD: $0.costUSD, totalTokens: $0.totalTokens)
-            },
-            recentDailyTotals: recentDailyTotals,
-            recentDailyByHost: recentDailyByHost,
-            historicalUnavailableHosts: historicalUnavailableHosts,
-            todayUnavailableHosts: todayUnavailableHosts
+            recordedPeriodText: "Recorded \(earliestRecordedDate) to \(summary.latestRecordedDate)",
+            partialDataText: partialDataMessage(
+                unavailableHosts: historicalUnavailableHosts.union(todayUnavailableHosts)
+            ),
+            totalRow: Row(
+                id: "total",
+                label: "Total",
+                allTime: lowerBoundCurrency(aggregation.allTimeTotalUSD, hasGap: hasHistoricalGaps),
+                monthToDate: lowerBoundCurrency(summary.monthToDate.totalCostUSD, hasGap: hasHistoricalGaps),
+                yesterday: lowerBoundCurrency(yesterday.totalUSD, hasGap: hasHistoricalGaps),
+                today: lowerBoundCurrency(todayTotalUSD, hasGap: hasTodayGaps),
+                sparkline: sparkline(for: recentDailyTotals)
+            ),
+            hostRows: makeHostRows(
+                allTime: allTimeByHost,
+                monthToDate: monthToDateByHost,
+                yesterday: yesterday.byHost,
+                today: todayByHost,
+                recentDailyByHost: recentDailyByHost,
+                historicalUnavailableHosts: historicalUnavailableHosts,
+                todayUnavailableHosts: todayUnavailableHosts
+            ),
+            menuBarBadgeText: partialPrefix(hasGaps: hasHistoricalGaps)
+                + compactCurrency(summary.monthToDate.totalCostUSD),
+            todayMenuBarBadgeText: partialPrefix(hasGaps: hasTodayGaps)
+                + trailingDollarCompactCurrency(todayTotalUSD)
         )
     }
 
@@ -224,26 +97,25 @@ struct CodexUsageSnapshot: Sendable {
         summary: SummaryDocument,
         aggregation: LedgerAggregation,
         hosts: [String]
-    ) -> (date: String, totalUSD: Double, byHost: [HostLatest]) {
+    ) -> (totalUSD: Double, byHost: [HostCost]) {
         if let yesterday = summary.yesterday {
             let byHost = yesterday.byHost.map {
-                HostLatest(host: $0.host, date: $0.date, costUSD: $0.costUSD, totalTokens: $0.totalTokens)
+                HostCost(host: $0.host, costUSD: $0.costUSD)
             }
-            return (yesterday.date, yesterday.totalCostUSD, byHost)
+            return (yesterday.totalCostUSD, byHost)
         }
 
         guard summary.latestRecordedDate == yesterdayDateString(inTimezone: summary.timezone) else {
-            return ("", 0, [])
+            return (0, [])
         }
 
-        let byHost = hosts.compactMap { host -> HostLatest? in
+        let byHost = hosts.compactMap { host -> HostCost? in
             let costUSD = aggregation.dailyTotalsByHost[host]?[summary.latestRecordedDate] ?? 0
             guard costUSD > 0 else { return nil }
-            return HostLatest(host: host, date: summary.latestRecordedDate, costUSD: costUSD, totalTokens: 0)
+            return HostCost(host: host, costUSD: costUSD)
         }
 
         return (
-            summary.latestRecordedDate,
             aggregation.dailyTotals[summary.latestRecordedDate, default: 0],
             byHost
         )
@@ -261,6 +133,98 @@ struct CodexUsageSnapshot: Sendable {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: yesterday)
+    }
+
+    private static func makeHostRows(
+        allTime: [HostCost],
+        monthToDate: [HostCost],
+        yesterday: [HostCost],
+        today: [HostCost],
+        recentDailyByHost: [String: [Double]],
+        historicalUnavailableHosts: Set<String>,
+        todayUnavailableHosts: Set<String>
+    ) -> [Row] {
+        let monthToDateCosts = costsByHost(monthToDate)
+        let yesterdayCosts = costsByHost(yesterday)
+        let todayCosts = costsByHost(today)
+
+        return allTime
+            .sorted { hostSortKey($0.host) < hostSortKey($1.host) }
+            .map { host in
+                let hasHistoricalGap = historicalUnavailableHosts.contains(host.host)
+                return Row(
+                    id: host.host,
+                    label: hostDisplayName(host.host),
+                    allTime: lowerBoundCurrency(host.costUSD, hasGap: hasHistoricalGap),
+                    monthToDate: lowerBoundCurrency(
+                        monthToDateCosts[host.host, default: 0],
+                        hasGap: hasHistoricalGap
+                    ),
+                    yesterday: hasHistoricalGap
+                        ? "—"
+                        : wholeCurrency(yesterdayCosts[host.host, default: 0]),
+                    today: todayUnavailableHosts.contains(host.host)
+                        ? "—"
+                        : wholeCurrency(todayCosts[host.host, default: 0]),
+                    sparkline: sparkline(for: recentDailyByHost[host.host, default: []])
+                )
+            }
+    }
+
+    private static func costsByHost(_ costs: [HostCost]) -> [String: Double] {
+        Dictionary(costs.map { ($0.host, $0.costUSD) }, uniquingKeysWith: { _, latest in latest })
+    }
+
+    private static func partialDataMessage(unavailableHosts: Set<String>) -> String? {
+        guard !unavailableHosts.isEmpty else { return nil }
+
+        let description = unavailableHosts
+            .map(hostDisplayName)
+            .sorted()
+            .joined(separator: ", ")
+        return "Partial data; unavailable: \(description)"
+    }
+
+    private static func hostDisplayName(_ host: String) -> String {
+        host == "local" ? "MacBook" : host.capitalized
+    }
+
+    private static func lowerBoundCurrency(_ amount: Double, hasGap: Bool) -> String {
+        partialPrefix(hasGaps: hasGap) + wholeCurrency(amount)
+    }
+
+    private static func wholeCurrency(_ amount: Double) -> String {
+        wholeCurrencyFormatter.string(from: NSNumber(value: amount)) ?? "$\(Int(amount.rounded()))"
+    }
+
+    private static func compactCurrency(_ amount: Double) -> String {
+        let absoluteAmount = abs(amount)
+
+        if absoluteAmount >= 1_000 {
+            return "$" + compactThousands(amount)
+        }
+
+        if absoluteAmount >= 100 {
+            return "$\(Int(amount.rounded()))"
+        }
+
+        if absoluteAmount >= 10 {
+            return String(format: "$%.1f", amount)
+        }
+
+        return String(format: "$%.2f", amount)
+    }
+
+    private static func trailingDollarCompactCurrency(_ amount: Double) -> String {
+        abs(amount) >= 1_000 ? compactThousands(amount) + "$" : "\(Int(amount.rounded()))$"
+    }
+
+    private static func compactThousands(_ amount: Double) -> String {
+        String(format: "%.1fk", amount / 1_000).replacingOccurrences(of: ".0k", with: "k")
+    }
+
+    private static func partialPrefix(hasGaps: Bool) -> String {
+        hasGaps ? "≥" : ""
     }
 
     private static func orderedHosts(summary: SummaryDocument, ledgerHosts: Set<String>) -> [String] {
@@ -307,9 +271,7 @@ struct CodexUsageSnapshot: Sendable {
             }
 
             var hostTotals = aggregation.hostTotals[row.host] ?? HostTotals()
-            hostTotals.rows += 1
             hostTotals.totalCostUSD += row.costUSD
-            hostTotals.latestDate = max(hostTotals.latestDate, row.date)
             aggregation.hostTotals[row.host] = hostTotals
         }
 
@@ -357,9 +319,12 @@ private struct LedgerAggregation {
 }
 
 private struct HostTotals {
-    var rows = 0
     var totalCostUSD = 0.0
-    var latestDate = ""
+}
+
+private struct HostCost {
+    let host: String
+    let costUSD: Double
 }
 
 private struct SummaryDocument: Decodable {
@@ -371,9 +336,7 @@ private struct SummaryDocument: Decodable {
     struct MonthToDate: Decodable {
         struct HostEntry: Decodable {
             let host: String
-            let rows: Int
             let totalCostUSD: Double
-            let latestDate: String
         }
 
         let totalCostUSD: Double
@@ -382,19 +345,15 @@ private struct SummaryDocument: Decodable {
 
     struct LatestHostEntry: Decodable {
         let host: String
-        let date: String
         let costUSD: Double
-        let totalTokens: Int
     }
 
     struct DaySummary: Decodable {
-        let date: String
         let totalCostUSD: Double
         let byHost: [LatestHostEntry]
         let unavailableHosts: [String]?
     }
 
-    let generatedAt: String
     let timezone: String
     let latestRecordedDate: String
     let collection: Collection?
