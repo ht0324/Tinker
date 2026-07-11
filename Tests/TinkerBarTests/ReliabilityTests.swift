@@ -464,7 +464,7 @@ private func makeTaskFixture(
     let task = AutomationTaskState(
         configuration: configuration,
         paths: paths,
-        snapshot: TaskSnapshotLoader().snapshot(for: paths),
+        snapshot: TaskStatusStore.snapshot(for: paths),
         isEnabled: true,
         isRunning: false
     )

@@ -8,7 +8,6 @@ struct TaskDiscovery {
 struct TaskCatalog {
     private let fileManager: FileManager
     private let builtInTasks: BuiltinTaskInstaller
-    private let snapshotLoader: TaskSnapshotLoader
     private let installsBuiltInTasks: Bool
 
     let appSupportDirectory: URL
@@ -18,7 +17,6 @@ struct TaskCatalog {
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         fileManager: FileManager = .default,
         builtInTasks: BuiltinTaskInstaller = BuiltinTaskInstaller(),
-        snapshotLoader: TaskSnapshotLoader = TaskSnapshotLoader(),
         installsBuiltInTasks: Bool = true
     ) {
         self.init(
@@ -28,7 +26,6 @@ struct TaskCatalog {
                 .appendingPathComponent("TinkerBar", isDirectory: true),
             fileManager: fileManager,
             builtInTasks: builtInTasks,
-            snapshotLoader: snapshotLoader,
             installsBuiltInTasks: installsBuiltInTasks
         )
     }
@@ -37,14 +34,12 @@ struct TaskCatalog {
         appSupportDirectory: URL,
         fileManager: FileManager = .default,
         builtInTasks: BuiltinTaskInstaller = BuiltinTaskInstaller(),
-        snapshotLoader: TaskSnapshotLoader = TaskSnapshotLoader(),
         installsBuiltInTasks: Bool = true
     ) {
         self.appSupportDirectory = appSupportDirectory
         self.tasksDirectory = appSupportDirectory.appendingPathComponent("tasks", isDirectory: true)
         self.fileManager = fileManager
         self.builtInTasks = builtInTasks
-        self.snapshotLoader = snapshotLoader
         self.installsBuiltInTasks = installsBuiltInTasks
     }
 
@@ -79,7 +74,7 @@ struct TaskCatalog {
                     AutomationTaskState(
                         configuration: configuration,
                         paths: paths,
-                        snapshot: snapshot(for: paths),
+                        snapshot: TaskStatusStore.snapshot(for: paths, fileManager: fileManager),
                         isEnabled: false,
                         isRunning: false
                     )
@@ -97,10 +92,6 @@ struct TaskCatalog {
         }
 
         return discovery
-    }
-
-    func snapshot(for paths: AutomationTaskPaths) -> AutomationTaskSnapshot {
-        snapshotLoader.snapshot(for: paths)
     }
 
     private func taskSortPriority(_ taskID: String) -> Int {

@@ -146,7 +146,7 @@ final class AutomationRuntime: ObservableObject {
         quietHours: AutomationQuietHours = .overnight,
         dateProvider: @escaping () -> Date = Date.init,
         snapshotLoader: @escaping @Sendable (AutomationTaskPaths) -> AutomationTaskSnapshot = { paths in
-            TaskSnapshotLoader().snapshot(for: paths)
+            TaskStatusStore.snapshot(for: paths)
         },
         autoload: Bool = true,
         loadStartupState: Bool = true

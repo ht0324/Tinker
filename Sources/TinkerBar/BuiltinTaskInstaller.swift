@@ -27,9 +27,7 @@ struct BuiltinTaskInstaller {
 
         try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.scriptFile.path)
 
-        if !fileManager.fileExists(atPath: paths.statusFile.path) {
-            try emptyStatusFile.write(to: paths.statusFile, atomically: true, encoding: .utf8)
-        }
+        try TaskStatusStore.createFileIfNeeded(for: paths, fileManager: fileManager)
     }
 
     private func builtinScriptContents(for configuration: AutomationTaskConfiguration) throws -> String? {
@@ -52,10 +50,6 @@ struct BuiltinTaskInstaller {
         let existing = try? String(contentsOf: url, encoding: .utf8)
         guard existing != contents else { return }
         try contents.write(to: url, atomically: true, encoding: .utf8)
-    }
-
-    private var emptyStatusFile: String {
-        "last_run_iso\t\nlast_success_iso\t\nsuccess_count\t0\nlast_output\t\nlast_error\t\n"
     }
 
     private var defaultTaskConfigurations: [AutomationTaskConfiguration] {

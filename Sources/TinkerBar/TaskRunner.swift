@@ -33,19 +33,13 @@ struct TaskRunner: @unchecked Sendable {
         _ timeout: TimeInterval
     ) -> CommandResult
 
-    typealias SnapshotLoader = @Sendable (AutomationTaskPaths) -> AutomationTaskSnapshot
-
     private let fileManager: FileManager
     private let commandExecutor: CommandExecutor
     private let executionTimeout: TimeInterval
-    private let snapshotLoader: SnapshotLoader
 
     init(
         fileManager: FileManager = .default,
         executionTimeout: TimeInterval = 30 * 60,
-        snapshotLoader: @escaping SnapshotLoader = { paths in
-            TaskSnapshotLoader().snapshot(for: paths)
-        },
         commandExecutor: @escaping CommandExecutor = { executable, arguments, timeout in
             CommandRunner.run(
                 executable,
@@ -56,7 +50,6 @@ struct TaskRunner: @unchecked Sendable {
     ) {
         self.fileManager = fileManager
         self.executionTimeout = executionTimeout
-        self.snapshotLoader = snapshotLoader
         self.commandExecutor = commandExecutor
     }
 
@@ -67,7 +60,7 @@ struct TaskRunner: @unchecked Sendable {
                 persistRunnerError(
                     message,
                     for: task,
-                    current: snapshotLoader(task.paths)
+                    current: TaskStatusStore.snapshot(for: task.paths, fileManager: fileManager)
                 )
             )
         }
@@ -79,13 +72,13 @@ struct TaskRunner: @unchecked Sendable {
                 )
             }
 
-            let startingSnapshot = snapshotLoader(task.paths)
+            let startingSnapshot = TaskStatusStore.snapshot(for: task.paths, fileManager: fileManager)
             let result = commandExecutor(
                 "/bin/zsh",
                 try workerArguments(for: task, event: event),
                 executionTimeout
             )
-            let snapshot = snapshotLoader(task.paths)
+            let snapshot = TaskStatusStore.snapshot(for: task.paths, fileManager: fileManager)
             return outcome(
                 for: task,
                 commandResult: result,
@@ -99,7 +92,7 @@ struct TaskRunner: @unchecked Sendable {
                 persistRunnerError(
                     message,
                     for: task,
-                    current: snapshotLoader(task.paths)
+                    current: TaskStatusStore.snapshot(for: task.paths, fileManager: fileManager)
                 )
             )
         }
@@ -220,53 +213,12 @@ struct TaskRunner: @unchecked Sendable {
         for task: AutomationTaskState,
         current snapshot: AutomationTaskSnapshot
     ) -> AutomationTaskSnapshot {
-        let sanitizedMessage = sanitizedStatusValue(message, maxLength: 512)
-        var entries = statusEntries(at: task.paths.statusFile)
-        setStatusValue(ISO8601DateFormatter().string(from: Date()), for: "last_run_iso", entries: &entries)
-        setStatusValue(sanitizedMessage, for: "last_error", entries: &entries)
-
-        let defaults = [
-            StatusEntry(key: "last_success_iso", value: ""),
-            StatusEntry(key: "success_count", value: "0"),
-            StatusEntry(key: "last_output", value: ""),
-        ]
-        for entry in defaults where !entries.contains(where: { $0.key == entry.key }) {
-            entries.append(entry)
-        }
-
-        let statusText = entries
-            .map { "\($0.key)\t\($0.value)" }
-            .joined(separator: "\n") + "\n"
-
-        do {
-            try statusText.write(to: task.paths.statusFile, atomically: true, encoding: .utf8)
-            return snapshotLoader(task.paths)
-        } catch {
-            var fallbackSnapshot = snapshot
-            fallbackSnapshot.lastError = sanitizedMessage
-            return fallbackSnapshot
-        }
-    }
-
-    private func statusEntries(at url: URL) -> [StatusEntry] {
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-
-        return contents.split(separator: "\n").compactMap { line in
-            let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-            guard let key = parts.first, !key.isEmpty else { return nil }
-            return StatusEntry(
-                key: String(key),
-                value: parts.count > 1 ? String(parts[1]) : ""
-            )
-        }
-    }
-
-    private func setStatusValue(_ value: String, for key: String, entries: inout [StatusEntry]) {
-        if let index = entries.firstIndex(where: { $0.key == key }) {
-            entries[index].value = value
-        } else {
-            entries.append(StatusEntry(key: key, value: value))
-        }
+        TaskStatusStore.recordingRunnerError(
+            message,
+            in: snapshot,
+            for: task.paths,
+            fileManager: fileManager
+        )
     }
 
     private func sanitizedStatusValue(_ value: String, maxLength: Int) -> String {
@@ -326,8 +278,4 @@ struct TaskRunner: @unchecked Sendable {
         return directoryURL
     }
 
-    private struct StatusEntry {
-        let key: String
-        var value: String
-    }
 }
