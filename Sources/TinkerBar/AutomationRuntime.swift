@@ -126,13 +126,8 @@ final class AutomationRuntime: ObservableObject {
     private let dateProvider: () -> Date
     private let snapshotLoader: @Sendable (AutomationTaskPaths) -> AutomationTaskSnapshot
 
-    private var directoryMonitors: [String: DirectoryMonitor] = [:]
-    private var applicationMonitors: [String: ApplicationMonitor] = [:]
-    private var pendingRunTasks: [String: Task<Void, Never>] = [:]
-    private var intervalTimers: [String: DispatchSourceTimer] = [:]
-    private var quietHourDeferredRunTimers: [String: DispatchSourceTimer] = [:]
-    private var runningTaskExecutions: [String: Task<TaskRunOutcome, Never>] = [:]
-    private var coalescedRunSources: [String: TaskRunRequestSource] = [:]
+    private var taskLifecycles: [String: TaskLifecycle] = [:]
+    private var nextSchedulingToken: UInt = 0
     private var refreshGeneration = 0
 
     private let codexUsageTaskID = "codex-usage-ledger"
@@ -277,10 +272,10 @@ final class AutomationRuntime: ObservableObject {
     }
 
     func cancelTaskRun(_ taskID: String) {
-        guard let execution = runningTaskExecutions[taskID] else { return }
+        guard let lifecycle = taskLifecycles[taskID], let execution = lifecycle.execution else { return }
 
         execution.cancel()
-        coalescedRunSources.removeValue(forKey: taskID)
+        lifecycle.clearCoalescedRun()
 
         if let task = task(taskID) {
             message = "Stopping \(task.configuration.name)..."
@@ -288,11 +283,14 @@ final class AutomationRuntime: ObservableObject {
     }
 
     func cancelAllTaskRuns() async {
-        let executions = Array(runningTaskExecutions.values)
+        let lifecycles = Array(taskLifecycles.values)
+        let executions = lifecycles.compactMap(\.execution)
         for execution in executions {
             execution.cancel()
         }
-        coalescedRunSources.removeAll()
+        for lifecycle in lifecycles {
+            lifecycle.clearCoalescedRun()
+        }
 
         for execution in executions {
             _ = await execution.value
@@ -307,10 +305,10 @@ final class AutomationRuntime: ObservableObject {
             return
         }
 
-        if runningTaskExecutions[taskID] != nil {
+        if let lifecycle = taskLifecycles[taskID], lifecycle.isRunning {
             switch source {
             case .directory, .application:
-                coalescedRunSources[taskID] = source
+                lifecycle.coalesceRun(source)
             case .manual, .interval:
                 break
             }
@@ -382,7 +380,7 @@ final class AutomationRuntime: ObservableObject {
             for index in loadedTasks.indices {
                 let id = loadedTasks[index].id
                 loadedTasks[index].isEnabled = enablementStore.isEnabled(id)
-                loadedTasks[index].isRunning = runningTaskExecutions[id] != nil
+                loadedTasks[index].isRunning = taskLifecycles[id]?.isRunning == true
             }
 
             stopAllTaskScheduling()
@@ -422,26 +420,38 @@ final class AutomationRuntime: ObservableObject {
         let task = tasks[index]
         try runner.ensureAccess(for: task)
         stopTaskScheduling(taskID)
+        let lifecycle = lifecycle(for: taskID)
 
         switch task.configuration.triggerKind {
         case .directory:
             guard let directoryURL = task.configuration.resolvedDirectoryURL else {
                 throw AutomationError.invalidConfiguration("\(task.configuration.name) needs a directoryPath in task.json.")
             }
+            let schedulingToken = activateScheduling(lifecycle)
 
             let monitor = DirectoryMonitor(url: directoryURL) { [weak self] in
                 Task { @MainActor in
-                    self?.scheduleTaskRun(taskID)
+                    guard let self, self.isActiveScheduling(schedulingToken, for: taskID) else { return }
+                    self.scheduleTaskRun(taskID, schedulingToken: schedulingToken)
                 }
             }
 
-            try monitor.start()
-            directoryMonitors[taskID] = monitor
+            lifecycle.trigger = .directory(monitor)
+            do {
+                try monitor.start()
+            } catch {
+                monitor.stop()
+                lifecycle.trigger = nil
+                lifecycle.schedulingToken = nil
+                removeLifecycleIfIdle(taskID)
+                throw error
+            }
 
             if startMode.shouldRunDirectoryTaskImmediately {
                 requestTaskRun(taskID, source: .directory)
             }
         case .interval:
+            let schedulingToken = activateScheduling(lifecycle)
             let intervalSeconds = intervalSeconds(for: task.configuration)
             let launchPlan = intervalLaunchPlan(
                 for: task,
@@ -450,14 +460,11 @@ final class AutomationRuntime: ObservableObject {
                 now: dateProvider()
             )
 
-            if launchPlan.shouldRunWhenReady {
-                requestTaskRun(taskID, source: .interval)
-            }
-
             let firstDelay = launchPlan.shouldRunWhenReady ? intervalSeconds : launchPlan.initialDelaySeconds
             let eventHandler: @Sendable () -> Void = { [weak self] in
                 Task { @MainActor in
-                    self?.requestTaskRun(taskID, source: .interval)
+                    guard let self, self.isActiveScheduling(schedulingToken, for: taskID) else { return }
+                    self.requestTaskRun(taskID, source: .interval)
                 }
             }
             let timer = Self.makeIntervalTimer(
@@ -466,63 +473,82 @@ final class AutomationRuntime: ObservableObject {
                 eventHandler: eventHandler
             )
             timer.resume()
-            intervalTimers[taskID] = timer
+            lifecycle.trigger = .interval(timer)
+
+            if launchPlan.shouldRunWhenReady {
+                requestTaskRun(taskID, source: .interval)
+            }
         case .application:
+            let schedulingToken = activateScheduling(lifecycle)
             let monitor = ApplicationMonitor(configuration: task.configuration) { [weak self] event in
                 Task { @MainActor in
-                    self?.requestTaskRun(taskID, source: .application(event))
+                    guard let self, self.isActiveScheduling(schedulingToken, for: taskID) else { return }
+                    self.requestTaskRun(taskID, source: .application(event))
                 }
             }
 
-            try monitor.start()
-            applicationMonitors[taskID] = monitor
+            lifecycle.trigger = .application(monitor)
+            do {
+                try monitor.start()
+            } catch {
+                monitor.stop()
+                lifecycle.trigger = nil
+                lifecycle.schedulingToken = nil
+                removeLifecycleIfIdle(taskID)
+                throw error
+            }
         }
     }
 
     private func stopTaskScheduling(_ taskID: String) {
-        pendingRunTasks[taskID]?.cancel()
-        pendingRunTasks[taskID] = nil
+        guard let lifecycle = taskLifecycles[taskID] else { return }
 
-        intervalTimers[taskID]?.cancel()
-        intervalTimers[taskID] = nil
+        lifecycle.schedulingToken = nil
 
-        quietHourDeferredRunTimers[taskID]?.cancel()
-        quietHourDeferredRunTimers[taskID] = nil
+        lifecycle.pendingDirectoryRun?.cancel()
+        lifecycle.pendingDirectoryRun = nil
 
-        directoryMonitors[taskID]?.stop()
-        directoryMonitors[taskID] = nil
+        lifecycle.trigger?.stop()
+        lifecycle.trigger = nil
 
-        applicationMonitors[taskID]?.stop()
-        applicationMonitors[taskID] = nil
+        lifecycle.quietHoursTimer?.cancel()
+        lifecycle.quietHoursTimer = nil
 
-        coalescedRunSources.removeValue(forKey: taskID)
+        lifecycle.clearCoalescedRun()
+        removeLifecycleIfIdle(taskID)
     }
 
     private func stopAllTaskScheduling() {
-        for taskID in tasks.map(\.id) {
+        for taskID in Array(taskLifecycles.keys) {
             stopTaskScheduling(taskID)
         }
     }
 
-    private func scheduleTaskRun(_ taskID: String) {
-        pendingRunTasks[taskID]?.cancel()
-        pendingRunTasks[taskID] = Task { [weak self] in
+    private func scheduleTaskRun(_ taskID: String, schedulingToken: UInt) {
+        guard
+            isActiveScheduling(schedulingToken, for: taskID),
+            let lifecycle = taskLifecycles[taskID]
+        else {
+            return
+        }
+
+        lifecycle.pendingDirectoryRun?.cancel()
+        lifecycle.pendingDirectoryRun = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(800))
             guard !Task.isCancelled else { return }
 
             await MainActor.run {
-                self?.requestTaskRun(taskID, source: .directory)
+                guard let self, self.isActiveScheduling(schedulingToken, for: taskID) else { return }
+                self.taskLifecycles[taskID]?.pendingDirectoryRun = nil
+                self.requestTaskRun(taskID, source: .directory)
             }
         }
     }
 
     private func startTaskRun(_ taskID: String, source: TaskRunRequestSource) {
-        guard
-            let index = indexOfTask(taskID),
-            runningTaskExecutions[taskID] == nil
-        else {
-            return
-        }
+        guard let index = indexOfTask(taskID) else { return }
+        let lifecycle = lifecycle(for: taskID)
+        guard !lifecycle.isRunning else { return }
 
         let task = tasks[index]
         updateTask(at: index) { task in
@@ -532,7 +558,7 @@ final class AutomationRuntime: ObservableObject {
         let execution = Task.detached(priority: .utility) { [runner, task, source] in
             runner.run(task, event: source.applicationEvent)
         }
-        runningTaskExecutions[taskID] = execution
+        lifecycle.beginRun(execution)
 
         Task { [weak self, execution, taskID, source] in
             let outcome = await execution.value
@@ -545,10 +571,11 @@ final class AutomationRuntime: ObservableObject {
         source: TaskRunRequestSource,
         outcome: TaskRunOutcome
     ) {
-        guard runningTaskExecutions.removeValue(forKey: taskID) != nil else { return }
+        guard let lifecycle = taskLifecycles[taskID], lifecycle.isRunning else { return }
+        let nextSource = lifecycle.finishRun()
         invalidateInFlightRefreshes()
         guard let refreshedIndex = indexOfTask(taskID) else {
-            coalescedRunSources.removeValue(forKey: taskID)
+            removeLifecycleIfIdle(taskID)
             return
         }
 
@@ -570,12 +597,10 @@ final class AutomationRuntime: ObservableObject {
             self.message = "\(updatedTask.configuration.name) stopped."
         }
 
-        if outcome.allowsCoalescedFollowUp,
-           let nextSource = coalescedRunSources.removeValue(forKey: taskID),
-           updatedTask.isEnabled {
+        if outcome.allowsCoalescedFollowUp, let nextSource, updatedTask.isEnabled {
             requestTaskRun(taskID, source: nextSource)
         } else {
-            coalescedRunSources.removeValue(forKey: taskID)
+            removeLifecycleIfIdle(taskID)
         }
     }
 
@@ -584,21 +609,27 @@ final class AutomationRuntime: ObservableObject {
     }
 
     private func deferTaskRunUntilQuietHoursEnd(_ taskID: String, source: TaskRunRequestSource) {
-        guard quietHourDeferredRunTimers[taskID] == nil else { return }
+        let lifecycle = lifecycle(for: taskID)
+        guard
+            lifecycle.quietHoursTimer == nil,
+            let schedulingToken = lifecycle.schedulingToken
+        else {
+            return
+        }
 
         let now = dateProvider()
         let nextAllowedDate = quietHours.nextAllowedDate(after: now)
         let delay = max(nextAllowedDate.timeIntervalSince(now), 0)
         let eventHandler: @Sendable () -> Void = { [weak self] in
             Task { @MainActor in
-                self?.quietHourDeferredRunTimers[taskID] = nil
-                guard self?.task(taskID)?.isEnabled == true else { return }
-                self?.requestTaskRun(taskID, source: source)
+                guard let self, self.isActiveScheduling(schedulingToken, for: taskID) else { return }
+                self.taskLifecycles[taskID]?.quietHoursTimer = nil
+                self.requestTaskRun(taskID, source: source)
             }
         }
         let timer = Self.makeOneShotTimer(delay: delay, eventHandler: eventHandler)
         timer.resume()
-        quietHourDeferredRunTimers[taskID] = timer
+        lifecycle.quietHoursTimer = timer
     }
 
     private func intervalSeconds(for configuration: AutomationTaskConfiguration) -> Double {
@@ -673,6 +704,32 @@ final class AutomationRuntime: ObservableObject {
         tasks.firstIndex(where: { $0.id == taskID })
     }
 
+    private func lifecycle(for taskID: String) -> TaskLifecycle {
+        if let lifecycle = taskLifecycles[taskID] {
+            return lifecycle
+        }
+
+        let lifecycle = TaskLifecycle()
+        taskLifecycles[taskID] = lifecycle
+        return lifecycle
+    }
+
+    private func activateScheduling(_ lifecycle: TaskLifecycle) -> UInt {
+        nextSchedulingToken &+= 1
+        lifecycle.schedulingToken = nextSchedulingToken
+        return nextSchedulingToken
+    }
+
+    private func isActiveScheduling(_ schedulingToken: UInt, for taskID: String) -> Bool {
+        taskLifecycles[taskID]?.schedulingToken == schedulingToken
+            && task(taskID)?.isEnabled == true
+    }
+
+    private func removeLifecycleIfIdle(_ taskID: String) {
+        guard taskLifecycles[taskID]?.canBeRemoved == true else { return }
+        taskLifecycles[taskID] = nil
+    }
+
     private func invalidateInFlightRefreshes() {
         refreshGeneration += 1
     }
@@ -694,6 +751,84 @@ final class AutomationRuntime: ObservableObject {
         formatter.timeZone = quietHours.calendar.timeZone
         formatter.dateFormat = "h a"
         return formatter.string(from: date)
+    }
+
+    private final class TaskLifecycle {
+        var schedulingToken: UInt?
+        var trigger: TriggerRegistration?
+        var pendingDirectoryRun: Task<Void, Never>?
+        var quietHoursTimer: DispatchSourceTimer?
+        private var runState = RunState.idle
+
+        var execution: Task<TaskRunOutcome, Never>? {
+            runState.execution
+        }
+
+        var isRunning: Bool {
+            execution != nil
+        }
+
+        var canBeRemoved: Bool {
+            schedulingToken == nil
+                && trigger == nil
+                && pendingDirectoryRun == nil
+                && quietHoursTimer == nil
+                && !isRunning
+        }
+
+        func beginRun(_ execution: Task<TaskRunOutcome, Never>) {
+            runState = .running(execution: execution, coalescedSource: nil)
+        }
+
+        func coalesceRun(_ source: TaskRunRequestSource) {
+            guard case .running(let execution, _) = runState else { return }
+            runState = .running(execution: execution, coalescedSource: source)
+        }
+
+        func clearCoalescedRun() {
+            guard case .running(let execution, _) = runState else { return }
+            runState = .running(execution: execution, coalescedSource: nil)
+        }
+
+        func finishRun() -> TaskRunRequestSource? {
+            guard case .running(_, let coalescedSource) = runState else { return nil }
+            runState = .idle
+            return coalescedSource
+        }
+    }
+
+    private enum RunState {
+        case idle
+        case running(
+            execution: Task<TaskRunOutcome, Never>,
+            coalescedSource: TaskRunRequestSource?
+        )
+
+        var execution: Task<TaskRunOutcome, Never>? {
+            switch self {
+            case .idle:
+                return nil
+            case .running(let execution, _):
+                return execution
+            }
+        }
+    }
+
+    private enum TriggerRegistration {
+        case directory(DirectoryMonitor)
+        case application(ApplicationMonitor)
+        case interval(DispatchSourceTimer)
+
+        func stop() {
+            switch self {
+            case .directory(let monitor):
+                monitor.stop()
+            case .application(let monitor):
+                monitor.stop()
+            case .interval(let timer):
+                timer.cancel()
+            }
+        }
     }
 
     private enum TaskStartMode {

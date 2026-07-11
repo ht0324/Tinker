@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Darwin
 import XCTest
 @testable import TinkerBar
 
@@ -479,6 +480,136 @@ final class AutomationRuntimeTests: XCTestCase {
         XCTAssertTrue(runtime.tasks.first?.isRunning == false)
 
         runtime.toggleTask("photos")
+    }
+
+    @MainActor
+    func testRunningTaskSurvivesReloadAndFinishesNormally() async throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        try writeTask(
+            id: "usage",
+            name: "Usage",
+            triggerKind: .interval,
+            appSupportDirectory: appSupportDirectory
+        )
+
+        let executor = BlockingCommandExecutor()
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+            runner: TaskRunner(commandExecutor: executor.execute),
+            autoload: false,
+            loadStartupState: false
+        )
+
+        runtime.reloadTasks()
+        runtime.runTaskNow("usage")
+        let started = await executor.waitForCallCount(1)
+        XCTAssertTrue(started)
+
+        runtime.reloadTasks()
+        XCTAssertTrue(runtime.tasks.first?.isRunning == true)
+
+        executor.unblockFirstCall()
+        let finished = await waitUntilOnMainActor(timeout: 2) {
+            runtime.tasks.first?.isRunning == false
+        }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(executor.callCount, 1)
+    }
+
+    @MainActor
+    func testDisablingTaskDropsCoalescedDirectoryRun() async throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        let watchedDirectory = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: appSupportDirectory)
+            try? FileManager.default.removeItem(at: watchedDirectory)
+        }
+
+        try writeTask(
+            id: "photos",
+            name: "Photos",
+            triggerKind: .directory,
+            directoryPath: watchedDirectory.path,
+            appSupportDirectory: appSupportDirectory
+        )
+
+        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let enablementStore = TaskEnablementStore(defaults: defaults)
+        enablementStore.setEnabled(true, taskID: "photos")
+        let executor = BlockingCommandExecutor()
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+            runner: TaskRunner(commandExecutor: executor.execute),
+            enablementStore: enablementStore,
+            autoload: false,
+            loadStartupState: false
+        )
+
+        runtime.reloadTasks()
+        runtime.requestTaskRun("photos", source: .directory)
+        let started = await executor.waitForCallCount(1)
+        XCTAssertTrue(started)
+        runtime.requestTaskRun("photos", source: .directory)
+
+        runtime.toggleTask("photos")
+        executor.unblockFirstCall()
+        let finished = await waitUntilOnMainActor(timeout: 2) {
+            runtime.tasks.first?.isRunning == false
+        }
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(executor.callCount, 1)
+        XCTAssertTrue(runtime.tasks.first?.isEnabled == false)
+    }
+
+    @MainActor
+    func testQueuedDirectoryCallbackDoesNotRunAfterDisable() async throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        let watchedDirectory = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: appSupportDirectory)
+            try? FileManager.default.removeItem(at: watchedDirectory)
+        }
+
+        try writeTask(
+            id: "photos",
+            name: "Photos",
+            triggerKind: .directory,
+            directoryPath: watchedDirectory.path,
+            appSupportDirectory: appSupportDirectory
+        )
+
+        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let enablementStore = TaskEnablementStore(defaults: defaults)
+        enablementStore.setEnabled(true, taskID: "photos")
+        let capture = CommandCapture()
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+            runner: TaskRunner(commandExecutor: capture.execute),
+            enablementStore: enablementStore,
+            autoload: false,
+            loadStartupState: false
+        )
+
+        runtime.reloadTasks()
+        try Data("queued".utf8).write(to: watchedDirectory.appendingPathComponent("queued.heic"))
+
+        // Keep the main actor occupied long enough for the monitor queue to
+        // enqueue its callback, then invalidate that registration before it runs.
+        usleep(1_000_000)
+        runtime.toggleTask("photos")
+        try? await Task.sleep(for: .seconds(1))
+
+        XCTAssertEqual(capture.calls.count, 0)
+        XCTAssertTrue(runtime.tasks.first?.isEnabled == false)
     }
 
     @MainActor
