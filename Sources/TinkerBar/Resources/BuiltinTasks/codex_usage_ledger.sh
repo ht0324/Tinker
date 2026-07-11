@@ -41,7 +41,8 @@ touch "$LEDGER_FILE"
 exec >>"$LOG_FILE" 2>&1
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  exit 0
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] error: another run owns $LOCK_DIR"
+  exit 75
 fi
 TEMP_FILES=()
 cleanup() {
@@ -111,6 +112,25 @@ run_with_timeout() {
       exec @cmd or die "exec failed: $!\n";
     }
 
+    my $stop_child_group = sub {
+      my ($exit_code) = @_;
+      kill "TERM", -$pid;
+      my $grace_deadline = time() + 0.25;
+      my $child_reaped = 0;
+      while (time() < $grace_deadline) {
+        if (!$child_reaped) {
+          my $done = waitpid($pid, WNOHANG);
+          $child_reaped = 1 if $done == $pid;
+        }
+        last if $child_reaped && !kill(0, -$pid);
+        select undef, undef, undef, 0.02;
+      }
+
+      kill "KILL", -$pid if kill(0, -$pid);
+      waitpid($pid, 0) unless $child_reaped;
+      exit $exit_code;
+    };
+
     my $deadline = time() + $timeout;
     while (1) {
       my $done = waitpid($pid, WNOHANG);
@@ -122,11 +142,7 @@ run_with_timeout() {
 
       if (time() >= $deadline) {
         warn "command timed out after ${timeout}s: @cmd\n";
-        kill "TERM", -$pid;
-        select undef, undef, undef, 1;
-        kill "KILL", -$pid;
-        waitpid($pid, 0);
-        exit 124;
+        $stop_child_group->(124);
       }
 
       select undef, undef, undef, 0.2;
@@ -183,6 +199,36 @@ set -euo pipefail
 export PATH="\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"
 ccusage-codex daily --json --timezone '$TIMEZONE' --since '$since_date' --until '$until_date'
 EOF
+}
+
+fetch_daily_range_json() {
+  local host="$1"
+  local since_date="$2"
+  local until_date="$3"
+
+  if [[ "$host" == "local" ]]; then
+    fetch_local_daily_range_json "$since_date" "$until_date"
+  else
+    fetch_remote_daily_range_json "$host" "$since_date" "$until_date"
+  fi
+}
+
+record_collection_failure() {
+  local host="$1"
+  local phase="$2"
+  local message="$3"
+
+  COLLECTION_ERRORS+=("$message")
+  case "$phase" in
+    historical) HISTORICAL_FAILED_HOSTS+=("$host") ;;
+    today) TODAY_FAILED_HOSTS+=("$host") ;;
+  esac
+  echo "[$(timestamp)] error: $message"
+}
+
+is_valid_daily_json() {
+  local json_file="$1"
+  jq -e '.daily | type == "array"' "$json_file" >/dev/null 2>&1
 }
 
 extract_row_for_date() {
@@ -301,8 +347,16 @@ write_summary() {
   local today_rows_file="$3"
   local today_date="$4"
   local yesterday_date="$5"
+  local configured_hosts_json historical_failed_hosts_json today_failed_hosts_json collection_errors_json summary_tmp
 
-  jq -s --slurpfile todayRows "$today_rows_file" --arg generatedAt "$generated_at" --arg timezone "$TIMEZONE" --arg monthStart "$month_start" --arg todayDate "$today_date" --arg yesterdayDate "$yesterday_date" '
+  configured_hosts_json=$(printf '%s\n' "${CONFIGURED_HOSTS[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
+  historical_failed_hosts_json=$(printf '%s\n' "${HISTORICAL_FAILED_HOSTS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
+  today_failed_hosts_json=$(printf '%s\n' "${TODAY_FAILED_HOSTS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
+  collection_errors_json=$(printf '%s\n' "${COLLECTION_ERRORS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+
+  summary_tmp="${SUMMARY_FILE}.tmp"
+  TEMP_FILES+=("$summary_tmp")
+  jq -s --slurpfile todayRows "$today_rows_file" --arg generatedAt "$generated_at" --arg timezone "$TIMEZONE" --arg monthStart "$month_start" --arg todayDate "$today_date" --arg yesterdayDate "$yesterday_date" --argjson configuredHosts "$configured_hosts_json" --argjson historicalFailedHosts "$historical_failed_hosts_json" --argjson todayFailedHosts "$today_failed_hosts_json" --argjson collectionErrors "$collection_errors_json" '
     def by_host(rows):
       (rows
         | sort_by(.host)
@@ -331,6 +385,14 @@ write_summary() {
       timezone: $timezone,
       rows: length,
       latestRecordedDate: (map(.date) | max // ""),
+      collection: {
+        status: (if (($historicalFailedHosts | length) + ($todayFailedHosts | length)) > 0 then "partial" else "complete" end),
+        expectedHosts: $configuredHosts,
+        failedHosts: (($historicalFailedHosts + $todayFailedHosts) | unique),
+        historicalFailedHosts: $historicalFailedHosts,
+        todayFailedHosts: $todayFailedHosts,
+        errors: $collectionErrors
+      },
       monthToDate: {
         since: $monthStart,
         totalCostUSD: (map(select(.date >= $monthStart)) | map(.costUSD // 0) | add // 0),
@@ -356,10 +418,12 @@ write_summary() {
         date: $todayDate,
         totalCostUSD: ($todayRows | map(.costUSD // 0) | add // 0),
         totalTokens: ($todayRows | map(.totalTokens // 0) | add // 0),
-        byHost: day_by_host($todayRows; $todayDate)
+        byHost: day_by_host($todayRows; $todayDate),
+        unavailableHosts: ($configuredHosts - ($todayRows | map(.host) | unique))
       }
     }
-  ' "$LEDGER_FILE" >"$SUMMARY_FILE"
+  ' "$LEDGER_FILE" >| "$summary_tmp"
+  mv "$summary_tmp" "$SUMMARY_FILE"
 }
 
 LAST_RUN_ISO=$(timestamp)
@@ -368,6 +432,10 @@ SUCCESS_COUNT=0
 LAST_OUTPUT=""
 LAST_ERROR=""
 ROWS_ADDED=0
+CONFIGURED_HOSTS=(local "${REMOTE_HOSTS[@]}")
+COLLECTION_ERRORS=()
+HISTORICAL_FAILED_HOSTS=()
+TODAY_FAILED_HOSTS=()
 
 if [[ -f "$STATUS_FILE" ]]; then
   while IFS=$'\t' read -r key value; do
@@ -393,10 +461,7 @@ if [[ "${REBUILD_LEDGER:-0}" == "1" ]]; then
 fi
 
 require_command jq
-require_command "$CCUSAGE_CODEX_BIN"
-if (( ${#REMOTE_HOSTS[@]} > 0 )); then
-  require_command "$SSH_BIN"
-fi
+require_command perl
 
 END_DATE=$(yesterday_in_timezone)
 TODAY_DATE=$(today_in_timezone)
@@ -420,20 +485,16 @@ for host in local "${REMOTE_HOSTS[@]}"; do
 
   json_file=$(mktemp)
   TEMP_FILES+=("$json_file")
-  if [[ "$host" == "local" ]]; then
-    if ! fetch_local_daily_range_json "$current_date" "$END_DATE" >"$json_file"; then
-      rm -f "$json_file"
-      LAST_ERROR="Failed to collect local usage from $current_date through $END_DATE"
-      echo "[$(timestamp)] error: $LAST_ERROR"
-      break
-    fi
-  else
-    if ! fetch_remote_daily_range_json "$host" "$current_date" "$END_DATE" >"$json_file"; then
-      rm -f "$json_file"
-      LAST_ERROR="Failed to collect $host usage from $current_date through $END_DATE"
-      echo "[$(timestamp)] error: $LAST_ERROR"
-      break
-    fi
+  if ! fetch_daily_range_json "$host" "$current_date" "$END_DATE" >"$json_file"; then
+    rm -f "$json_file"
+    record_collection_failure "$host" historical "Failed to collect $host usage from $current_date through $END_DATE"
+    continue
+  fi
+
+  if ! is_valid_daily_json "$json_file"; then
+    rm -f "$json_file"
+    record_collection_failure "$host" historical "Invalid usage response from $host for $current_date through $END_DATE"
+    continue
   fi
 
   if [[ -z "$latest_date" ]]; then
@@ -451,31 +512,31 @@ for host in local "${REMOTE_HOSTS[@]}"; do
   rm -f "$json_file"
 done
 
-if [[ -z "$LAST_ERROR" ]]; then
-  for host in local "${REMOTE_HOSTS[@]}"; do
-    echo "[$(timestamp)] collecting $host usage for today so far: $TODAY_DATE"
+for host in local "${REMOTE_HOSTS[@]}"; do
+  echo "[$(timestamp)] collecting $host usage for today so far: $TODAY_DATE"
 
-    json_file=$(mktemp)
-    TEMP_FILES+=("$json_file")
-    if [[ "$host" == "local" ]]; then
-      if ! fetch_local_daily_range_json "$TODAY_DATE" "$TODAY_DATE" >"$json_file"; then
-        LAST_ERROR="Failed to collect local usage for today so far: $TODAY_DATE"
-        echo "[$(timestamp)] error: $LAST_ERROR"
-        break
-      fi
-    else
-      if ! fetch_remote_daily_range_json "$host" "$TODAY_DATE" "$TODAY_DATE" >"$json_file"; then
-        LAST_ERROR="Failed to collect $host usage for today so far: $TODAY_DATE"
-        echo "[$(timestamp)] error: $LAST_ERROR"
-        break
-      fi
-    fi
-
-    captured_at=$(timestamp)
-    today_row=$(extract_row_for_date "$json_file" "$host" "$TODAY_DATE" "$captured_at")
-    apply_codex_fast_mode_adjustment "$today_row" >>"$TODAY_ROWS_FILE"
+  json_file=$(mktemp)
+  TEMP_FILES+=("$json_file")
+  if ! fetch_daily_range_json "$host" "$TODAY_DATE" "$TODAY_DATE" >"$json_file"; then
     rm -f "$json_file"
-  done
+    record_collection_failure "$host" today "Failed to collect $host usage for today so far: $TODAY_DATE"
+    continue
+  fi
+
+  if ! is_valid_daily_json "$json_file"; then
+    rm -f "$json_file"
+    record_collection_failure "$host" today "Invalid usage response from $host for today: $TODAY_DATE"
+    continue
+  fi
+
+  captured_at=$(timestamp)
+  today_row=$(extract_row_for_date "$json_file" "$host" "$TODAY_DATE" "$captured_at")
+  apply_codex_fast_mode_adjustment "$today_row" >>"$TODAY_ROWS_FILE"
+  rm -f "$json_file"
+done
+
+if (( ${#COLLECTION_ERRORS[@]} > 0 )); then
+  LAST_ERROR="${(j:; :)COLLECTION_ERRORS}"
 fi
 
 write_summary "$LAST_RUN_ISO" "$MONTH_START" "$TODAY_ROWS_FILE" "$TODAY_DATE" "$END_DATE"
@@ -491,7 +552,7 @@ today_cost=$(jq -r '.today.totalCostUSD // 0' "$SUMMARY_FILE")
 today_cost_fmt=$(printf "%.2f" "$today_cost")
 
 if [[ -n "$LAST_ERROR" ]]; then
-  LAST_OUTPUT="Ledger currently has $SUCCESS_COUNT rows through ${latest_recorded_date:-unknown}"
+  LAST_OUTPUT="Partial collection; ledger has $SUCCESS_COUNT rows through ${latest_recorded_date:-unknown}; known today total \$${today_cost_fmt}"
 else
   LAST_SUCCESS_ISO=$(timestamp)
   if [[ "$ROWS_ADDED" -gt 0 ]]; then

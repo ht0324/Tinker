@@ -12,7 +12,8 @@ mkdir -p "${STATUS_FILE:h}" "${LOG_FILE:h}"
 exec >>"$LOG_FILE" 2>&1
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  exit 0
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] error: another run owns $LOCK_DIR"
+  exit 75
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
@@ -72,3 +73,7 @@ tmp_file="${STATUS_FILE}.tmp"
   printf 'last_error\t%s\n' "$LAST_ERROR"
 } >| "$tmp_file"
 mv "$tmp_file" "$STATUS_FILE"
+
+if [[ -n "$LAST_ERROR" ]]; then
+  exit 1
+fi

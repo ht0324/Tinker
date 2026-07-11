@@ -135,6 +135,7 @@ final class AutomationRuntime: ObservableObject {
     private var intervalTimers: [String: DispatchSourceTimer] = [:]
     private var quietHourDeferredRunTimers: [String: DispatchSourceTimer] = [:]
     private var runningTaskIDs: Set<String> = []
+    private var runningTaskExecutions: [String: ActiveTaskExecution] = [:]
     private var coalescedRunSources: [String: TaskRunRequestSource] = [:]
     private var refreshGeneration = 0
 
@@ -277,6 +278,31 @@ final class AutomationRuntime: ObservableObject {
 
     func runTaskNow(_ taskID: String) {
         requestTaskRun(taskID, source: .manual)
+    }
+
+    func cancelTaskRun(_ taskID: String) {
+        guard runningTaskIDs.contains(taskID) else { return }
+
+        runningTaskExecutions[taskID]?.task.cancel()
+        runner.cancel(taskID)
+        coalescedRunSources.removeValue(forKey: taskID)
+
+        if let task = task(taskID) {
+            message = "Stopping \(task.configuration.name)..."
+        }
+    }
+
+    func cancelAllTaskRuns() async {
+        let executions = Array(runningTaskExecutions.values)
+        for execution in executions {
+            execution.task.cancel()
+        }
+        runner.cancelAll()
+        coalescedRunSources.removeAll()
+
+        for execution in executions {
+            _ = await execution.task.value
+        }
     }
 
     func requestTaskRun(_ taskID: String, source: TaskRunRequestSource) {
@@ -505,28 +531,26 @@ final class AutomationRuntime: ObservableObject {
             task.isRunning = true
         }
 
-        Task { [weak self, runner, task, taskID, source] in
-            guard let self else { return }
+        let executionID = UUID()
+        let execution = Task.detached(priority: .utility) { [runner, task, source] in
+            runner.run(task, event: source.applicationEvent)
+        }
+        runningTaskExecutions[taskID] = ActiveTaskExecution(id: executionID, task: execution)
 
-            let outcome = await Task.detached(priority: .utility) { [runner, task, source] in
-                let snapshotLoader = TaskSnapshotLoader()
-
-                do {
-                    try runner.run(task, event: source.applicationEvent)
-                    return TaskRunOutcome.success(snapshotLoader.snapshot(for: task.paths))
-                } catch {
-                    return TaskRunOutcome.failure(
-                        error.localizedDescription,
-                        snapshotLoader.snapshot(for: task.paths)
-                    )
-                }
-            }.value
-
-            self.finishTaskRun(taskID, source: source, outcome: outcome)
+        Task { [weak self, execution, executionID, taskID, source] in
+            let outcome = await execution.value
+            self?.finishTaskRun(taskID, executionID: executionID, source: source, outcome: outcome)
         }
     }
 
-    private func finishTaskRun(_ taskID: String, source: TaskRunRequestSource, outcome: TaskRunOutcome) {
+    private func finishTaskRun(
+        _ taskID: String,
+        executionID: UUID,
+        source: TaskRunRequestSource,
+        outcome: TaskRunOutcome
+    ) {
+        guard runningTaskExecutions[taskID]?.id == executionID else { return }
+        runningTaskExecutions.removeValue(forKey: taskID)
         runningTaskIDs.remove(taskID)
         invalidateInFlightRefreshes()
         guard let refreshedIndex = indexOfTask(taskID) else {
@@ -536,13 +560,7 @@ final class AutomationRuntime: ObservableObject {
 
         let updatedTask = updateTask(at: refreshedIndex) { task in
             task.isRunning = false
-
-            switch outcome {
-            case .success(let snapshot):
-                task.snapshot = snapshot
-            case .failure(_, let snapshot):
-                task.snapshot = snapshot
-            }
+            task.snapshot = outcome.snapshot
         }
 
         switch outcome {
@@ -552,10 +570,18 @@ final class AutomationRuntime: ObservableObject {
             }
         case .failure(let message, _):
             self.message = message
+        case .timedOut(let message, _):
+            self.message = message
+        case .cancelled:
+            self.message = "\(updatedTask.configuration.name) stopped."
         }
 
-        if let nextSource = coalescedRunSources.removeValue(forKey: taskID), updatedTask.isEnabled {
+        if outcome.allowsCoalescedFollowUp,
+           let nextSource = coalescedRunSources.removeValue(forKey: taskID),
+           updatedTask.isEnabled {
             requestTaskRun(taskID, source: nextSource)
+        } else {
+            coalescedRunSources.removeValue(forKey: taskID)
         }
     }
 
@@ -691,14 +717,14 @@ final class AutomationRuntime: ObservableObject {
         }
     }
 
-    private enum TaskRunOutcome: Sendable {
-        case success(AutomationTaskSnapshot)
-        case failure(String, AutomationTaskSnapshot)
-    }
-
     private struct IntervalLaunchPlan {
         let initialDelaySeconds: Double
         let shouldRunWhenReady: Bool
+    }
+
+    private struct ActiveTaskExecution {
+        let id: UUID
+        let task: Task<TaskRunOutcome, Never>
     }
 
     private static let iso8601Formatter = ISO8601DateFormatter()

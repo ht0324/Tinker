@@ -24,6 +24,9 @@ struct ContentView: View {
                 Menu(task.configuration.name) {
                     if let usage = task.snapshot.codexUsage {
                         Text("Recorded \(usage.earliestRecordedDate) to \(usage.latestRecordedDate)")
+                        if usage.isPartial {
+                            Text("Partial data; unavailable: \(unavailableHostsDescription(usage))")
+                        }
                         usageTableLine(usageTableHeader())
                         usageTableLine(usageTableRow(
                             label: "Total",
@@ -63,10 +66,16 @@ struct ContentView: View {
                     }
                     .disabled(runtime.isBusy || task.isRunning)
 
-                    Button("Run Now") {
-                        runtime.runTaskNow(task.id)
+                    if task.isRunning {
+                        Button("Stop Run") {
+                            runtime.cancelTaskRun(task.id)
+                        }
+                    } else {
+                        Button("Run Now") {
+                            runtime.runTaskNow(task.id)
+                        }
+                        .disabled(runtime.isBusy)
                     }
-                    .disabled(runtime.isBusy || task.isRunning)
 
                     Divider()
 
@@ -105,7 +114,10 @@ struct ContentView: View {
             Divider()
 
             Button("Quit") {
-                NSApp.terminate(nil)
+                Task {
+                    await runtime.cancelAllTaskRuns()
+                    NSApp.terminate(nil)
+                }
             }
             .keyboardShortcut("q")
         }
@@ -127,15 +139,27 @@ struct ContentView: View {
         let monthToDate = usage.monthToDateByHost.first { $0.host == host.host }?.totalCostUSD ?? 0
         let yesterday = usage.yesterdayByHost.first { $0.host == host.host }?.costUSD ?? 0
         let today = usage.todayByHost.first { $0.host == host.host }?.costUSD ?? 0
+        let hasHistoricalGap = usage.hasHistoricalGap(for: host.host)
 
         return usageTableRow(
             label: CodexUsageSnapshot.hostDisplayName(host.host),
-            allTime: CodexUsageSnapshot.wholeCurrency(host.totalCostUSD),
-            monthToDate: CodexUsageSnapshot.wholeCurrency(monthToDate),
-            yesterday: CodexUsageSnapshot.wholeCurrency(yesterday),
-            today: CodexUsageSnapshot.wholeCurrency(today),
+            allTime: lowerBoundCurrency(host.totalCostUSD, hasGap: hasHistoricalGap),
+            monthToDate: lowerBoundCurrency(monthToDate, hasGap: hasHistoricalGap),
+            yesterday: hasHistoricalGap ? "—" : CodexUsageSnapshot.wholeCurrency(yesterday),
+            today: usage.hasTodayGap(for: host.host) ? "—" : CodexUsageSnapshot.wholeCurrency(today),
             sparkline: usage.sparkline(for: host.host)
         )
+    }
+
+    private func lowerBoundCurrency(_ amount: Double, hasGap: Bool) -> String {
+        (hasGap ? "≥" : "") + CodexUsageSnapshot.wholeCurrency(amount)
+    }
+
+    private func unavailableHostsDescription(_ usage: CodexUsageSnapshot) -> String {
+        usage.unavailableHosts
+            .map(CodexUsageSnapshot.hostDisplayName)
+            .sorted()
+            .joined(separator: ", ")
     }
 
     private func usageTableRow(label: String, allTime: String, monthToDate: String, yesterday: String, today: String, sparkline: String) -> String {

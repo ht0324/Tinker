@@ -43,29 +43,41 @@ struct CodexUsageSnapshot: Sendable {
     let latestByHost: [HostLatest]
     let recentDailyTotals: [DailyCost]
     let recentDailyByHost: [String: [DailyCost]]
+    let expectedHosts: [String]
+    let historicalUnavailableHosts: Set<String>
+    let todayUnavailableHosts: Set<String>
+    let collectionErrors: [String]
+
+    var isPartial: Bool {
+        !historicalUnavailableHosts.isEmpty || !todayUnavailableHosts.isEmpty
+    }
+
+    var unavailableHosts: Set<String> {
+        historicalUnavailableHosts.union(todayUnavailableHosts)
+    }
 
     var menuBarBadgeText: String {
-        Self.compactCurrency(monthToDateTotalUSD)
+        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.compactCurrency(monthToDateTotalUSD)
     }
 
     var todayMenuBarBadgeText: String {
-        Self.trailingDollarCompactCurrency(todayTotalUSD)
+        partialPrefix(hasGaps: !todayUnavailableHosts.isEmpty) + Self.trailingDollarCompactCurrency(todayTotalUSD)
     }
 
     var formattedMonthToDateTotal: String {
-        Self.wholeCurrency(monthToDateTotalUSD)
+        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.wholeCurrency(monthToDateTotalUSD)
     }
 
     var formattedAllTimeTotal: String {
-        Self.wholeCurrency(allTimeTotalUSD)
+        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.wholeCurrency(allTimeTotalUSD)
     }
 
     var formattedYesterdayTotal: String {
-        Self.wholeCurrency(yesterdayTotalUSD)
+        partialPrefix(hasGaps: !historicalUnavailableHosts.isEmpty) + Self.wholeCurrency(yesterdayTotalUSD)
     }
 
     var formattedTodayTotal: String {
-        Self.wholeCurrency(todayTotalUSD)
+        partialPrefix(hasGaps: !todayUnavailableHosts.isEmpty) + Self.wholeCurrency(todayTotalUSD)
     }
 
     var totalSparkline: String {
@@ -78,6 +90,14 @@ struct CodexUsageSnapshot: Sendable {
 
     func sparkline(for host: String) -> String {
         Self.sparkline(for: recentDailyByHost[host, default: []].map(\.costUSD))
+    }
+
+    func hasHistoricalGap(for host: String) -> Bool {
+        historicalUnavailableHosts.contains(host)
+    }
+
+    func hasTodayGap(for host: String) -> Bool {
+        todayUnavailableHosts.contains(host)
     }
 
     static func hostDisplayName(_ host: String) -> String {
@@ -125,6 +145,10 @@ struct CodexUsageSnapshot: Sendable {
         String(format: "%.1fk", amount / 1_000).replacingOccurrences(of: ".0k", with: "k")
     }
 
+    private func partialPrefix(hasGaps: Bool) -> String {
+        hasGaps ? "≥" : ""
+    }
+
     static func load(summaryFile: URL, ledgerFile: URL) -> CodexUsageSnapshot? {
         CodexUsageSnapshotCache.shared.load(summaryFile: summaryFile, ledgerFile: ledgerFile) {
             loadUncached(summaryFile: summaryFile, ledgerFile: ledgerFile)
@@ -143,6 +167,13 @@ struct CodexUsageSnapshot: Sendable {
         let sortedDates = Array(aggregation.dates).sorted()
         let recentDates = Array(sortedDates.suffix(7))
         let hosts = orderedHosts(summary: summary, ledgerHosts: aggregation.hosts)
+        let expectedHosts = summary.collection?.expectedHosts ?? hosts
+        let historicalUnavailableHosts = Set(summary.collection?.historicalFailedHosts ?? [])
+        let todayUnavailableHosts = Set(
+            summary.today?.unavailableHosts
+                ?? summary.collection?.todayFailedHosts
+                ?? []
+        )
 
         let recentDailyTotals = recentDates.map { date in
             DailyCost(date: date, costUSD: aggregation.dailyTotals[date, default: 0])
@@ -190,7 +221,11 @@ struct CodexUsageSnapshot: Sendable {
                 HostLatest(host: $0.host, date: $0.date, costUSD: $0.costUSD, totalTokens: $0.totalTokens)
             },
             recentDailyTotals: recentDailyTotals,
-            recentDailyByHost: recentDailyByHost
+            recentDailyByHost: recentDailyByHost,
+            expectedHosts: expectedHosts,
+            historicalUnavailableHosts: historicalUnavailableHosts,
+            todayUnavailableHosts: todayUnavailableHosts,
+            collectionErrors: summary.collection?.errors ?? []
         )
     }
 
@@ -238,7 +273,11 @@ struct CodexUsageSnapshot: Sendable {
     }
 
     private static func orderedHosts(summary: SummaryDocument, ledgerHosts: Set<String>) -> [String] {
-        var orderedHosts = summary.monthToDate.byHost.map(\.host)
+        var orderedHosts = summary.collection?.expectedHosts ?? []
+
+        for host in summary.monthToDate.byHost.map(\.host) where !orderedHosts.contains(host) {
+            orderedHosts.append(host)
+        }
 
         for host in summary.latestByHost.map(\.host) where !orderedHosts.contains(host) {
             orderedHosts.append(host)
@@ -333,6 +372,15 @@ private struct HostTotals {
 }
 
 private struct SummaryDocument: Decodable {
+    struct Collection: Decodable {
+        let status: String
+        let expectedHosts: [String]
+        let failedHosts: [String]
+        let historicalFailedHosts: [String]
+        let todayFailedHosts: [String]
+        let errors: [String]
+    }
+
     struct MonthToDate: Decodable {
         struct HostEntry: Decodable {
             let host: String
@@ -356,11 +404,13 @@ private struct SummaryDocument: Decodable {
         let date: String
         let totalCostUSD: Double
         let byHost: [LatestHostEntry]
+        let unavailableHosts: [String]?
     }
 
     let generatedAt: String
     let timezone: String
     let latestRecordedDate: String
+    let collection: Collection?
     let monthToDate: MonthToDate
     let yesterday: DaySummary?
     let today: DaySummary?

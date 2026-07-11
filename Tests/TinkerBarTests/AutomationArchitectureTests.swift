@@ -85,7 +85,9 @@ final class TaskRunnerTests: XCTestCase {
         let capture = CommandCapture()
         let runner = TaskRunner(commandExecutor: capture.execute)
 
-        try runner.run(task)
+        guard case .success = runner.run(task) else {
+            return XCTFail("Expected directory worker to succeed")
+        }
 
         let call = try XCTUnwrap(capture.calls.first)
         XCTAssertEqual(call.executable, "/bin/zsh")
@@ -119,7 +121,9 @@ final class TaskRunnerTests: XCTestCase {
         let capture = CommandCapture()
         let runner = TaskRunner(commandExecutor: capture.execute)
 
-        try runner.run(task, event: .opened)
+        guard case .success = runner.run(task, event: .opened) else {
+            return XCTFail("Expected application worker to succeed")
+        }
 
         let call = try XCTUnwrap(capture.calls.first)
         XCTAssertEqual(call.executable, "/bin/zsh")
@@ -570,7 +574,12 @@ private final class CommandCapture: @unchecked Sendable {
         return recordedCalls
     }
 
-    func execute(_ executable: String, _ arguments: [String]) -> CommandResult {
+    func execute(
+        _ executable: String,
+        _ arguments: [String],
+        _ timeout: TimeInterval,
+        _ cancellation: CommandCancellationToken
+    ) -> CommandResult {
         lock.lock()
         recordedCalls.append(CommandCall(executable: executable, arguments: arguments))
         lock.unlock()
@@ -613,7 +622,12 @@ private final class BlockingCommandExecutor: @unchecked Sendable {
         return currentCallCount
     }
 
-    func execute(_ executable: String, _ arguments: [String]) -> CommandResult {
+    func execute(
+        _ executable: String,
+        _ arguments: [String],
+        _ timeout: TimeInterval,
+        _ cancellation: CommandCancellationToken
+    ) -> CommandResult {
         condition.lock()
         currentCallCount += 1
         activeCalls += 1

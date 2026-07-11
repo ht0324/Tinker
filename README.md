@@ -99,6 +99,8 @@ Script argument contracts:
 - Directory task: `run.sh <directoryPath> <statusFile> <logFile>`
 - Interval task: `run.sh <statusFile> <logFile>`
 
+Worker runs have a 30-minute deadline and can be stopped from the task menu. TinkerBar treats either a nonzero exit status or a nonempty `last_error` status value as a failed run, and records runner-level failures such as timeouts in `status.tsv`.
+
 ## Private Task Config
 
 The bundled Codex usage task reads an optional private env file from its runtime task folder:
