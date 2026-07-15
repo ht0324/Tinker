@@ -1,6 +1,7 @@
 import Foundation
 
 struct BuiltinTaskInstaller {
+    private static let codexUsageAppServerHelperFileName = "codex-usage-app-server.mjs"
     private let fileManager = FileManager.default
 
     func installDefaultTasksIfNeeded(tasksDirectory: URL) throws {
@@ -10,6 +11,8 @@ struct BuiltinTaskInstaller {
 
             if !fileManager.fileExists(atPath: paths.configFile.path) {
                 try writeConfiguration(configuration, to: paths.configFile)
+            } else {
+                try migrateConfigurationIfNeeded(defaultConfiguration: configuration, paths: paths)
             }
 
             try ensureSupportFiles(for: configuration, paths: paths)
@@ -27,7 +30,59 @@ struct BuiltinTaskInstaller {
 
         try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.scriptFile.path)
 
+        if configuration.id == "codex-usage-ledger" {
+            guard let helperURL = Bundle.module.url(
+                forResource: "codex_usage_app_server",
+                withExtension: "mjs"
+            ) else {
+                throw AutomationError.invalidConfiguration("Missing Codex usage App Server helper.")
+            }
+            let helperContents = try String(contentsOf: helperURL, encoding: .utf8)
+            let helperFile = paths.taskDirectory.appendingPathComponent(
+                Self.codexUsageAppServerHelperFileName
+            )
+            try writeIfChanged(contents: helperContents, to: helperFile)
+        }
+
         try TaskStatusStore.createFileIfNeeded(for: paths, fileManager: fileManager)
+    }
+
+    private func migrateConfigurationIfNeeded(
+        defaultConfiguration: AutomationTaskConfiguration,
+        paths: AutomationTaskPaths
+    ) throws {
+        guard defaultConfiguration.id == "codex-usage-ledger" else { return }
+
+        guard
+            let data = try? Data(contentsOf: paths.configFile),
+            var configuration = try? JSONDecoder().decode(AutomationTaskConfiguration.self, from: data)
+        else {
+            // TaskCatalog will report a malformed folder without preventing
+            // the remaining built-in and custom tasks from loading.
+            return
+        }
+        guard configuration.id == defaultConfiguration.id else { return }
+
+        var changed = false
+        let oldDetailPrefix = "Track Codex spend"
+        let detailSuffix = configuration.detail.dropFirst(
+            min(oldDetailPrefix.count, configuration.detail.count)
+        )
+        if configuration.detail.hasPrefix(oldDetailPrefix),
+           detailSuffix.isEmpty || detailSuffix.first?.isWhitespace == true {
+            configuration.detail = "Track estimated Codex API-equivalent cost"
+                + detailSuffix
+            changed = true
+        }
+
+        if configuration.scriptKind == nil {
+            configuration.scriptKind = defaultConfiguration.scriptKind
+            changed = true
+        }
+
+        if changed {
+            try writeConfiguration(configuration, to: paths.configFile)
+        }
     }
 
     private func builtinScriptContents(for configuration: AutomationTaskConfiguration) throws -> String? {
@@ -77,7 +132,7 @@ struct BuiltinTaskInstaller {
             AutomationTaskConfiguration(
                 id: "codex-usage-ledger",
                 name: "Codex Usage Ledger",
-                detail: "Track Codex spend for this Mac and any configured remote hosts.",
+                detail: "Track estimated Codex API-equivalent cost for this Mac and any configured remote hosts.",
                 scriptKind: "codex_usage_ledger",
                 triggerKind: .interval,
                 directoryPath: nil,

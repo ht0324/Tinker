@@ -58,6 +58,27 @@ final class TaskCatalogTests: XCTestCase {
         XCTAssertEqual(discovery.tasks.map(\.id), ["sample-interval"])
         XCTAssertEqual(discovery.skippedFolders, ["broken"])
     }
+
+    func testMalformedBuiltInTaskDoesNotPreventOtherTasksFromLoading() throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        let brokenDirectory = appSupportDirectory
+            .appendingPathComponent("tasks", isDirectory: true)
+            .appendingPathComponent("codex-usage-ledger", isDirectory: true)
+        try FileManager.default.createDirectory(at: brokenDirectory, withIntermediateDirectories: true)
+        try Data("not json".utf8).write(
+            to: brokenDirectory.appendingPathComponent("task.json")
+        )
+
+        let discovery = try TaskCatalog(appSupportDirectory: appSupportDirectory).discoverTasks()
+
+        XCTAssertEqual(
+            discovery.tasks.map(\.id),
+            ["codex-update", "heic-to-jpeg", "parsec-macmini-mirror"]
+        )
+        XCTAssertEqual(discovery.skippedFolders, ["codex-usage-ledger"])
+    }
 }
 
 final class TaskRunnerTests: XCTestCase {

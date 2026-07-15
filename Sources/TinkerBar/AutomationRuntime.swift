@@ -181,12 +181,13 @@ final class AutomationRuntime: ObservableObject {
         tasks.first(where: { $0.id == codexUsageTaskID })?.snapshot.codexUsage
     }
 
-    func menuBarTitle(showingTodaySpending: Bool) -> String {
-        if showingTodaySpending, let todayBadge = codexUsageSnapshot?.todayMenuBarBadgeText {
-            return todayBadge
+    func menuBarTitle(showingTodayEstimate: Bool) -> String {
+        guard let snapshot = codexUsageSnapshot, snapshot.isEstimateAvailable else {
+            return "TinkerBar"
         }
-
-        return codexUsageSnapshot?.menuBarBadgeText ?? "TinkerBar"
+        return showingTodayEstimate
+            ? snapshot.todayMenuBarBadgeText
+            : snapshot.menuBarBadgeText
     }
 
     var quietModeStatusText: String {

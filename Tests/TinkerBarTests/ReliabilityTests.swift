@@ -189,8 +189,12 @@ final class TaskRunnerReliabilityTests: XCTestCase {
 
 final class CodexUsageLedgerIntegrationTests: XCTestCase {
     func testUnavailableRemoteDoesNotBlockHealthyTodayCollection() throws {
-        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
-            throw XCTSkip("Codex usage worker requires jq and perl")
+        guard
+            executable(named: "jq") != nil,
+            executable(named: "perl") != nil,
+            let node = executable(named: "node")
+        else {
+            throw XCTSkip("Codex usage worker integration requires jq, perl, and Node.js")
         }
 
         let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerTests")
@@ -203,10 +207,14 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
 
         let fakeLocal = root.appendingPathComponent("fake-ccusage")
         let fakeSSH = root.appendingPathComponent("fake-ssh")
+        let fakeCodex = root.appendingPathComponent("fake-codex")
+        let invocationLog = root.appendingPathComponent("ccusage-invocations.log")
         try fakeLocalUsageScript.write(to: fakeLocal, atomically: true, encoding: .utf8)
         try fakeRemoteUsageScript.write(to: fakeSSH, atomically: true, encoding: .utf8)
+        try fakeCodexAppServerScript.write(to: fakeCodex, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLocal.path)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSSH.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -220,9 +228,12 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         environment["TINKERBAR_CODEX_USAGE_TIMEZONE"] = "UTC"
         environment["TINKERBAR_CODEX_USAGE_DISCOVERY_FLOOR_DATE"] = "2024-01-01"
         environment["TINKERBAR_CODEX_USAGE_FETCH_TIMEOUT_SECONDS"] = "5"
-        environment["TINKERBAR_CODEX_USAGE_CODEX_BIN"] = fakeLocal.path
+        environment["TINKERBAR_CODEX_USAGE_CCUSAGE_BIN"] = fakeLocal.path
+        environment["TINKERBAR_CODEX_USAGE_CODEX_CLI_BIN"] = fakeCodex.path
+        environment["TINKERBAR_CODEX_USAGE_NODE_BIN"] = node.path
         environment["TINKERBAR_CODEX_USAGE_SSH_BIN"] = fakeSSH.path
         environment["TINKERBAR_CODEX_USAGE_CONFIG_FILE"] = root.appendingPathComponent("no-config.env").path
+        environment["TINKERBAR_TEST_CCUSAGE_ARGS_FILE"] = invocationLog.path
         environment["REBUILD_LEDGER"] = "0"
         process.environment = environment
 
@@ -233,6 +244,11 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         let summaryData = try Data(contentsOf: usageTask.paths.summaryFile)
         let summary = try XCTUnwrap(JSONSerialization.jsonObject(with: summaryData) as? [String: Any])
         let collection = try XCTUnwrap(summary["collection"] as? [String: Any])
+        XCTAssertEqual(summary["ledgerSchemaVersion"] as? Int, 2)
+        XCTAssertEqual(summary["costBasis"] as? String, "estimated_standard_api_equivalent")
+        let collector = try XCTUnwrap(summary["collector"] as? [String: Any])
+        XCTAssertEqual(collector["version"] as? String, "20.0.17")
+        XCTAssertEqual(collector["speed"] as? String, "standard")
         let log = try String(contentsOf: usageTask.paths.logFile, encoding: .utf8)
         XCTAssertEqual(Set(collection["historicalFailedHosts"] as? [String] ?? []), Set(["offline"]), log)
         XCTAssertEqual(Set(collection["todayFailedHosts"] as? [String] ?? []), Set(["offline"]), log)
@@ -247,6 +263,30 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         XCTAssertTrue(ledger.contains("\"host\":\"local\""))
         XCTAssertTrue(ledger.contains("\"host\":\"remote-ok\""))
         XCTAssertFalse(ledger.contains("\"host\":\"offline\""))
+        XCTAssertTrue(ledger.contains("\"gpt-5.6-sol\""))
+        XCTAssertTrue(ledger.contains("\"gpt-5.6-terra\""))
+        XCTAssertTrue(ledger.contains("\"cacheReadTokens\""))
+        XCTAssertFalse(ledger.contains("pricingAdjustment"))
+
+        let models = try XCTUnwrap(summary["models"] as? [String: Any])
+        XCTAssertEqual(
+            Set(models["observedRecent"] as? [String] ?? []),
+            Set(["gpt-5.6-sol", "gpt-5.6-terra"])
+        )
+        XCTAssertEqual(
+            Set(models["currentCatalog"] as? [String] ?? []),
+            Set(["gpt-5.6-sol", "gpt-5.6-luna"])
+        )
+        XCTAssertEqual(Set(models["notInCurrentCatalog"] as? [String] ?? []), [])
+        let official = try XCTUnwrap(summary["official"] as? [String: Any])
+        let officialModels = try XCTUnwrap(official["models"] as? [String: Any])
+        XCTAssertEqual(officialModels["available"] as? Bool, true)
+        let accountUsage = try XCTUnwrap(official["accountUsage"] as? [String: Any])
+        XCTAssertEqual(accountUsage["available"] as? Bool, true)
+
+        let invocations = try String(contentsOf: invocationLog, encoding: .utf8)
+        XCTAssertTrue(invocations.contains("codex daily --json --offline --speed standard"), invocations)
+        XCTAssertTrue(invocations.contains("npx --yes 'ccusage@20.0.17' codex daily"), invocations)
 
         let snapshot = try XCTUnwrap(
             CodexUsageSnapshot.load(
@@ -255,6 +295,9 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
             )
         )
         XCTAssertEqual(snapshot.partialDataText, "Partial data; unavailable: Offline")
+        XCTAssertTrue(snapshot.estimateNoticeText.contains("ccusage 20.0.17"))
+        XCTAssertEqual(snapshot.modelSummaryText, "Recent models: gpt-5.6-sol, gpt-5.6-terra")
+        XCTAssertNotNil(snapshot.officialUsageText)
         XCTAssertEqual(snapshot.totalRow.today, "≥$4")
         let offlineRow = try XCTUnwrap(snapshot.hostRows.first(where: { $0.id == "offline" }))
         XCTAssertEqual(offlineRow.allTime, "≥$0")
@@ -265,6 +308,327 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         let status = try String(contentsOf: usageTask.paths.statusFile, encoding: .utf8)
         XCTAssertTrue(status.contains("last_error\tFailed to collect offline usage"))
         XCTAssertTrue(status.contains("last_output\tPartial collection"))
+    }
+
+    func testLegacyLedgerMigrationCommitsAtomicallyAndKeepsBackup() throws {
+        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
+            throw XCTSkip("Codex usage worker requires jq and perl")
+        }
+
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerMigrationTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let usageTask = try XCTUnwrap(
+            TaskCatalog(appSupportDirectory: root)
+                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
+        )
+        let fakeLocal = root.appendingPathComponent("fake-ccusage")
+        try fakeLocalUsageScript.write(to: fakeLocal, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLocal.path)
+
+        let legacyLedger = """
+        {"date":"\(utcDateString(daysFromToday: -1))","host":"local","costUSD":9999,"totalTokens":1,"pricingAdjustment":{"mode":"legacy"}}
+
+        """
+        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
+
+        let exitCode = try runLedgerWorker(
+            usageTask,
+            root: root,
+            localCollector: fakeLocal
+        )
+        XCTAssertEqual(exitCode, 0)
+
+        let rebuiltLedger = try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8)
+        XCTAssertNotEqual(rebuiltLedger, legacyLedger)
+        XCTAssertTrue(rebuiltLedger.contains("\"ledgerSchemaVersion\":2"))
+        XCTAssertTrue(rebuiltLedger.contains("\"version\":\"20.0.17\""))
+        XCTAssertFalse(rebuiltLedger.contains("pricingAdjustment"))
+        XCTAssertFalse(rebuiltLedger.contains("9999"))
+
+        let rebuiltSummaryData = try Data(contentsOf: usageTask.paths.summaryFile)
+        let rebuiltSummary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: rebuiltSummaryData) as? [String: Any]
+        )
+        XCTAssertEqual(rebuiltSummary["ledgerSchemaVersion"] as? Int, 2)
+        let rebuiltGeneration = try XCTUnwrap(rebuiltSummary["ledgerGeneration"] as? String)
+        XCTAssertEqual(
+            (rebuiltSummary["collector"] as? [String: Any])?["version"] as? String,
+            "20.0.17"
+        )
+        let rebuiltFirstRow = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(try XCTUnwrap(rebuiltLedger.split(separator: "\n").first).utf8)
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(rebuiltFirstRow["ledgerGeneration"] as? String, rebuiltGeneration)
+
+        let backups = try FileManager.default.contentsOfDirectory(
+            at: usageTask.paths.taskDirectory,
+            includingPropertiesForKeys: nil
+        ).filter {
+            $0.lastPathComponent.hasPrefix("ledger.jsonl.rebuild-") &&
+                $0.pathExtension == "bak"
+        }
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try String(contentsOf: XCTUnwrap(backups.first), encoding: .utf8), legacyLedger)
+    }
+
+    func testFailedLegacyLedgerMigrationRetainsOriginalWithoutBackupSwap() throws {
+        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
+            throw XCTSkip("Codex usage worker requires jq and perl")
+        }
+
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerRollbackTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let usageTask = try XCTUnwrap(
+            TaskCatalog(appSupportDirectory: root)
+                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
+        )
+        let fakeLocal = root.appendingPathComponent("fake-ccusage")
+        let fakeSSH = root.appendingPathComponent("fake-ssh")
+        try fakeLocalUsageScript.write(to: fakeLocal, atomically: true, encoding: .utf8)
+        try fakeRemoteUsageScript.write(to: fakeSSH, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLocal.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSSH.path)
+
+        let legacyLedger = """
+        {"date":"\(utcDateString(daysFromToday: -1))","host":"local","costUSD":9999,"totalTokens":1,"pricingAdjustment":{"mode":"legacy"}}
+
+        """
+        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
+
+        let exitCode = try runLedgerWorker(
+            usageTask,
+            root: root,
+            localCollector: fakeLocal,
+            remoteCollector: fakeSSH,
+            remoteHosts: "offline"
+        )
+        XCTAssertEqual(exitCode, 1)
+        XCTAssertEqual(
+            try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8),
+            legacyLedger
+        )
+
+        let backupNames = try FileManager.default.contentsOfDirectory(
+            atPath: usageTask.paths.taskDirectory.path
+        ).filter { $0.hasPrefix("ledger.jsonl.rebuild-") && $0.hasSuffix(".bak") }
+        XCTAssertTrue(backupNames.isEmpty)
+
+        let status = try String(contentsOf: usageTask.paths.statusFile, encoding: .utf8)
+        XCTAssertTrue(status.contains("Ledger rebuild not committed"), status)
+        XCTAssertTrue(status.contains("Previous ledger retained"), status)
+    }
+
+    func testTruncatedRebuildCoverageCannotReplaceEarlierHistory() throws {
+        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
+            throw XCTSkip("Codex usage worker requires jq and perl")
+        }
+
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerCoverageTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let usageTask = try XCTUnwrap(
+            TaskCatalog(appSupportDirectory: root)
+                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
+        )
+        let fakeLocal = root.appendingPathComponent("fake-ccusage")
+        try fakeLocalUsageScript.write(to: fakeLocal, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLocal.path)
+
+        let legacyLedger = """
+        {"date":"2026-01-01","host":"local","costUSD":1,"totalTokens":1}
+
+        """
+        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(
+            try runLedgerWorker(usageTask, root: root, localCollector: fakeLocal),
+            1
+        )
+        XCTAssertEqual(
+            try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8),
+            legacyLedger
+        )
+        let log = try String(contentsOf: usageTask.paths.logFile, encoding: .utf8)
+        XCTAssertTrue(log.contains("Incomplete usage coverage from local"), log)
+    }
+
+    func testEmptyRebuildResponseCannotEraseExistingHostHistory() throws {
+        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
+            throw XCTSkip("Codex usage worker requires jq and perl")
+        }
+
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerEmptyRebuildTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let usageTask = try XCTUnwrap(
+            TaskCatalog(appSupportDirectory: root)
+                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
+        )
+        let emptyCollector = root.appendingPathComponent("empty-ccusage")
+        try "#!/bin/zsh\nprint -r -- '{\"daily\":[],\"totals\":{}}'\n".write(
+            to: emptyCollector,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: emptyCollector.path
+        )
+
+        let legacyLedger = """
+        {"date":"2026-01-01","host":"local","costUSD":9999,"totalTokens":1}
+
+        """
+        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(
+            try runLedgerWorker(
+                usageTask,
+                root: root,
+                localCollector: emptyCollector
+            ),
+            1
+        )
+        XCTAssertEqual(
+            try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8),
+            legacyLedger
+        )
+        let status = try String(contentsOf: usageTask.paths.statusFile, encoding: .utf8)
+        let log = try String(contentsOf: usageTask.paths.logFile, encoding: .utf8)
+        XCTAssertTrue(log.contains("Empty usage response from local"), log)
+        XCTAssertTrue(status.contains("Ledger rebuild not committed"), status)
+        XCTAssertTrue(status.contains("Previous ledger retained"), status)
+    }
+
+    func testLegacySnapshotSuppressesKnownInvalidDollarTotals() throws {
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarLegacySnapshotTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let summaryFile = root.appendingPathComponent("latest-summary.json")
+        let ledgerFile = root.appendingPathComponent("ledger.jsonl")
+
+        try #"{"timezone":"UTC","latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":6855.45,"byHost":[{"host":"local","totalCostUSD":6855.45}]},"latestByHost":[{"host":"local","costUSD":9999}],"today":{"totalCostUSD":950.29,"byHost":[{"host":"local","costUSD":950.29}],"unavailableHosts":[]}}"#.write(
+            to: summaryFile,
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"date":"2026-07-13","host":"local","costUSD":9999}"#.write(
+            to: ledgerFile,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let snapshot = try XCTUnwrap(
+            CodexUsageSnapshot.load(summaryFile: summaryFile, ledgerFile: ledgerFile)
+        )
+        XCTAssertEqual(snapshot.totalRow.allTime, "—")
+        XCTAssertEqual(snapshot.totalRow.monthToDate, "—")
+        XCTAssertEqual(snapshot.totalRow.today, "—")
+        XCTAssertFalse(snapshot.isEstimateAvailable)
+        XCTAssertEqual(snapshot.availabilityMessageText, "Codex ledger rebuild required")
+        XCTAssertEqual(snapshot.menuBarBadgeText, "TinkerBar")
+        XCTAssertEqual(snapshot.todayMenuBarBadgeText, "TinkerBar")
+        XCTAssertTrue(snapshot.estimateNoticeText.contains("rebuild is required"))
+    }
+
+    func testMalformedOptionalOfficialUsageDoesNotHideValidEstimate() throws {
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarOfficialUsageDecodeTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let summaryFile = root.appendingPathComponent("latest-summary.json")
+        let ledgerFile = root.appendingPathComponent("ledger.jsonl")
+
+        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"generation-a","rows":1,"timezone":"UTC","collector":{"version":"20.0.17","speed":"standard"},"models":{"observedRecent":["gpt-5.6-sol"],"catalogAvailable":true,"notInCurrentCatalog":[],"fallbackAttributed":[],"possiblyUnpricedRows":[]},"official":{"probeWarning":42,"accountUsage":{"available":true,"dailyUsageBuckets":[{"startDate":42,"tokens":"bad"}]}},"latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":1.25,"byHost":[{"host":"local","totalCostUSD":1.25}]},"latestByHost":[{"host":"local","costUSD":1.25}],"yesterday":{"totalCostUSD":1.25,"byHost":[{"host":"local","costUSD":1.25}]},"today":{"totalCostUSD":0,"byHost":[],"unavailableHosts":[]}}"#.write(
+            to: summaryFile,
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"generation-a","date":"2026-07-13","host":"local","costUSD":1.25}"#.write(
+            to: ledgerFile,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let snapshot = try XCTUnwrap(
+            CodexUsageSnapshot.load(summaryFile: summaryFile, ledgerFile: ledgerFile)
+        )
+        XCTAssertEqual(snapshot.totalRow.allTime, "$1")
+        XCTAssertTrue(snapshot.isEstimateAvailable)
+        XCTAssertNil(snapshot.officialUsageText)
+        XCTAssertEqual(snapshot.modelSummaryText, "Recent models: gpt-5.6-sol")
+    }
+
+    func testMismatchedLedgerGenerationSuppressesMixedSnapshot() throws {
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerGenerationTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let summaryFile = root.appendingPathComponent("latest-summary.json")
+        let ledgerFile = root.appendingPathComponent("ledger.jsonl")
+
+        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"summary-generation","rows":1,"timezone":"UTC","collector":{"version":"20.0.17","speed":"standard"},"latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":9999,"byHost":[{"host":"local","totalCostUSD":9999}]},"latestByHost":[{"host":"local","costUSD":9999}],"today":{"totalCostUSD":9999,"byHost":[{"host":"local","costUSD":9999}],"unavailableHosts":[]}}"#.write(
+            to: summaryFile,
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"ledger-generation","date":"2026-07-13","host":"local","costUSD":1.25}"#.write(
+            to: ledgerFile,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let snapshot = try XCTUnwrap(
+            CodexUsageSnapshot.load(summaryFile: summaryFile, ledgerFile: ledgerFile)
+        )
+        XCTAssertFalse(snapshot.isEstimateAvailable)
+        XCTAssertEqual(snapshot.totalRow.allTime, "—")
+        XCTAssertEqual(
+            snapshot.availabilityMessageText,
+            "Codex ledger update incomplete; run the usage task again."
+        )
+    }
+
+    func testBuiltInUsageTaskMigratesOnlyTheLegacyDetailPrefix() throws {
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarUsageConfigMigrationTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let taskDirectory = root
+            .appendingPathComponent("tasks", isDirectory: true)
+            .appendingPathComponent("codex-usage-ledger", isDirectory: true)
+        try FileManager.default.createDirectory(at: taskDirectory, withIntermediateDirectories: true)
+
+        let configuration = AutomationTaskConfiguration(
+            id: "codex-usage-ledger",
+            name: "Codex Usage Ledger",
+            detail: "Track Codex spend for this Mac, Andrew, and Mac Mini.",
+            scriptKind: nil,
+            triggerKind: .interval,
+            directoryPath: nil,
+            intervalSeconds: 1_800,
+            openPath: "~/custom-ledger"
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(configuration).write(
+            to: taskDirectory.appendingPathComponent("task.json")
+        )
+
+        let usageTask = try XCTUnwrap(
+            TaskCatalog(appSupportDirectory: root)
+                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
+        )
+        XCTAssertEqual(
+            usageTask.configuration.detail,
+            "Track estimated Codex API-equivalent cost for this Mac, Andrew, and Mac Mini."
+        )
+        XCTAssertEqual(usageTask.configuration.scriptKind, "codex_usage_ledger")
+        XCTAssertEqual(usageTask.configuration.openPath, "~/custom-ledger")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: usageTask.paths.taskDirectory
+                    .appendingPathComponent("codex-usage-app-server.mjs")
+                    .path
+            )
+        )
     }
 
     func testCancellationStopsNestedUsageFetchProcessGroup() async throws {
@@ -286,7 +650,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         let processIDsFile = taskDirectory.appendingPathComponent("nested-processes.pid")
 
         try FileManager.default.copyItem(at: usageTask.paths.scriptFile, to: ledgerWorker)
-        try "#!/bin/zsh\nprint -r -- '{\"daily\":[]}'\n".write(
+        try "#!/bin/zsh\nprint -r -- '{\"daily\":[],\"totals\":{}}'\n".write(
             to: fakeLocal,
             atomically: true,
             encoding: .utf8
@@ -301,9 +665,10 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         export TINKERBAR_CODEX_USAGE_TIMEZONE=UTC
         export TINKERBAR_CODEX_USAGE_DISCOVERY_FLOOR_DATE=9999-12-31
         export TINKERBAR_CODEX_USAGE_FETCH_TIMEOUT_SECONDS=60
-        export TINKERBAR_CODEX_USAGE_CODEX_BIN=\(shellQuoted(fakeLocal.path))
+        export TINKERBAR_CODEX_USAGE_CCUSAGE_BIN=\(shellQuoted(fakeLocal.path))
         export TINKERBAR_CODEX_USAGE_SSH_BIN=\(shellQuoted(fakeSSH.path))
         export TINKERBAR_CODEX_USAGE_CONFIG_FILE=\(shellQuoted(taskDirectory.appendingPathComponent("no-config.env").path))
+        export TINKERBAR_CODEX_USAGE_OFFICIAL_PROBE_ENABLED=0
         export TINKERBAR_TEST_NESTED_PROCESS_IDS=\(shellQuoted(processIDsFile.path))
         exec /bin/zsh \(shellQuoted(ledgerWorker.path)) "$@"
         """
@@ -339,9 +704,16 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
     private var fakeLocalUsageScript: String {
         #"""
         #!/bin/zsh
-        yesterday_display=$(TZ=UTC /bin/date -v-1d "+%b %d, %Y")
-        today_display=$(TZ=UTC /bin/date "+%b %d, %Y")
-        print -r -- "{\"daily\":[{\"date\":\"$yesterday_display\",\"inputTokens\":1,\"cachedInputTokens\":0,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":2,\"costUSD\":1.25,\"models\":{}},{\"date\":\"$today_display\",\"inputTokens\":1,\"cachedInputTokens\":0,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":2,\"costUSD\":1.25,\"models\":{}}]}"
+        if [[ -n "${TINKERBAR_TEST_CCUSAGE_ARGS_FILE:-}" ]]; then
+          print -r -- "$*" >> "$TINKERBAR_TEST_CCUSAGE_ARGS_FILE"
+        fi
+        yesterday=$(TZ=UTC /bin/date -v-1d "+%Y-%m-%d")
+        today=$(TZ=UTC /bin/date "+%Y-%m-%d")
+        target_date="$yesterday"
+        if [[ " $* " == *" --since $today "* ]]; then
+          target_date="$today"
+        fi
+        print -r -- "{\"daily\":[{\"date\":\"$target_date\",\"inputTokens\":1,\"cacheCreationTokens\":0,\"cacheReadTokens\":3,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":5,\"costUSD\":1.25,\"models\":{\"gpt-5.6-sol\":{\"inputTokens\":1,\"cacheCreationTokens\":0,\"cacheReadTokens\":3,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":5,\"isFallback\":false}}}],\"totals\":{\"inputTokens\":1,\"cacheCreationTokens\":0,\"cacheReadTokens\":3,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":5,\"costUSD\":1.25}}"
         """#
     }
 
@@ -357,10 +729,99 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         if [[ "$host" == "offline" ]]; then
           exit 23
         fi
-        yesterday_display=$(TZ=UTC /bin/date -v-1d "+%b %d, %Y")
-        today_display=$(TZ=UTC /bin/date "+%b %d, %Y")
-        print -r -- "{\"daily\":[{\"date\":\"$yesterday_display\",\"inputTokens\":1,\"cachedInputTokens\":0,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":2,\"costUSD\":2.75,\"models\":{}},{\"date\":\"$today_display\",\"inputTokens\":1,\"cachedInputTokens\":0,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":2,\"costUSD\":2.75,\"models\":{}}]}"
+        payload=$(/bin/cat)
+        if [[ -n "${TINKERBAR_TEST_CCUSAGE_ARGS_FILE:-}" ]]; then
+          print -r -- "$payload" >> "$TINKERBAR_TEST_CCUSAGE_ARGS_FILE"
+        fi
+        yesterday=$(TZ=UTC /bin/date -v-1d "+%Y-%m-%d")
+        today=$(TZ=UTC /bin/date "+%Y-%m-%d")
+        target_date="$yesterday"
+        if [[ "$payload" == *"--since '$today' --until '$today'"* ]]; then
+          target_date="$today"
+        fi
+        print -r -- "{\"daily\":[{\"date\":\"$target_date\",\"inputTokens\":2,\"cacheCreationTokens\":0,\"cacheReadTokens\":4,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":7,\"costUSD\":2.75,\"models\":{\"gpt-5.6-terra\":{\"inputTokens\":2,\"cacheCreationTokens\":0,\"cacheReadTokens\":4,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":7,\"isFallback\":false}}}],\"totals\":{\"inputTokens\":2,\"cacheCreationTokens\":0,\"cacheReadTokens\":4,\"outputTokens\":1,\"reasoningOutputTokens\":0,\"totalTokens\":7,\"costUSD\":2.75}}"
         """#
+    }
+
+    private var fakeCodexAppServerScript: String {
+        #"""
+        #!/bin/zsh
+        emulate -LR zsh
+        set -euo pipefail
+
+        IFS= read -r initialize
+        initialize_id=$(print -r -- "$initialize" | jq -r '.id')
+        print -r -- "{\"id\":$initialize_id,\"result\":{\"userAgent\":\"fake\"}}"
+
+        IFS= read -r initialized
+        IFS= read -r first_request
+        IFS= read -r second_request
+
+        first_method=$(print -r -- "$first_request" | jq -r '.method')
+        if [[ "$first_method" == "model/list" ]]; then
+          model_request="$first_request"
+          usage_request="$second_request"
+        else
+          model_request="$second_request"
+          usage_request="$first_request"
+        fi
+
+        usage_id=$(print -r -- "$usage_request" | jq -r '.id')
+        today=$(TZ=UTC /bin/date "+%Y-%m-%d")
+        print -r -- "{\"id\":$usage_id,\"result\":{\"summary\":{\"lifetimeTokens\":12345},\"dailyUsageBuckets\":[{\"startDate\":\"$today\",\"tokens\":12345}]}}"
+
+        model_id=$(print -r -- "$model_request" | jq -r '.id')
+        print -r -- "{\"id\":$model_id,\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",\"model\":\"gpt-5.6-sol\",\"displayName\":\"GPT-5.6 Sol\",\"hidden\":false}],\"nextCursor\":\"page-2\"}}"
+
+        IFS= read -r next_page
+        next_page_id=$(print -r -- "$next_page" | jq -r '.id')
+        print -r -- "{\"id\":$next_page_id,\"result\":{\"data\":[{\"id\":\"gpt-5.6-luna\",\"model\":\"gpt-5.6-luna\",\"displayName\":\"GPT-5.6 Luna\",\"hidden\":false}],\"nextCursor\":null}}"
+        """#
+    }
+
+    private func runLedgerWorker(
+        _ usageTask: AutomationTaskState,
+        root: URL,
+        localCollector: URL,
+        remoteCollector: URL? = nil,
+        remoteHosts: String = ""
+    ) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [
+            usageTask.paths.scriptFile.path,
+            usageTask.paths.statusFile.path,
+            usageTask.paths.logFile.path,
+        ]
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["TINKERBAR_CODEX_USAGE_REMOTE_HOSTS"] = remoteHosts
+        environment["TINKERBAR_CODEX_USAGE_TIMEZONE"] = "UTC"
+        environment["TINKERBAR_CODEX_USAGE_DISCOVERY_FLOOR_DATE"] = "2024-01-01"
+        environment["TINKERBAR_CODEX_USAGE_FETCH_TIMEOUT_SECONDS"] = "5"
+        environment["TINKERBAR_CODEX_USAGE_CCUSAGE_BIN"] = localCollector.path
+        environment["TINKERBAR_CODEX_USAGE_SSH_BIN"] = remoteCollector?.path ?? "/usr/bin/false"
+        environment["TINKERBAR_CODEX_USAGE_CONFIG_FILE"] = root
+            .appendingPathComponent("no-config.env").path
+        environment["TINKERBAR_CODEX_USAGE_OFFICIAL_PROBE_ENABLED"] = "0"
+        environment["REBUILD_LEDGER"] = "0"
+        process.environment = environment
+
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    private func utcDateString(daysFromToday offset: Int) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let date = calendar.date(byAdding: .day, value: offset, to: Date())!
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
     }
 
     private var nestedProcessUsageScript: String {

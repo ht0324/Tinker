@@ -12,7 +12,13 @@ struct CodexUsageSnapshot: Sendable {
     }
 
     let recordedPeriodText: String
+    let estimateNoticeText: String
     let partialDataText: String?
+    let modelSummaryText: String?
+    let dataQualityText: String?
+    let officialUsageText: String?
+    let isEstimateAvailable: Bool
+    let availabilityMessageText: String?
     let totalRow: Row
     let hostRows: [Row]
     let menuBarBadgeText: String
@@ -32,7 +38,19 @@ struct CodexUsageSnapshot: Sendable {
             return nil
         }
 
+        guard summary.ledgerSchemaVersion == 2 else {
+            return legacyPlaceholder(summary: summary)
+        }
+
         let aggregation = loadLedgerAggregation(from: ledgerFile)
+        guard ledgerIntegrityIsValid(summary: summary, aggregation: aggregation) else {
+            return unavailablePlaceholder(
+                recordedPeriodText: "Ledger update incomplete",
+                estimateNoticeText: "Estimate unavailable until the ledger and summary match.",
+                availabilityMessageText: "Codex ledger update incomplete; run the usage task again.",
+                dataQualityText: "Ledger and summary generation mismatch"
+            )
+        }
         let sortedDates = Array(aggregation.dates).sorted()
         let recentDates = Array(sortedDates.suffix(7))
         let hosts = orderedHosts(summary: summary, ledgerHosts: aggregation.hosts)
@@ -65,9 +83,15 @@ struct CodexUsageSnapshot: Sendable {
 
         return CodexUsageSnapshot(
             recordedPeriodText: "Recorded \(earliestRecordedDate) to \(summary.latestRecordedDate)",
+            estimateNoticeText: estimateNotice(summary: summary),
             partialDataText: partialDataMessage(
                 unavailableHosts: historicalUnavailableHosts.union(todayUnavailableHosts)
             ),
+            modelSummaryText: modelSummary(summary: summary),
+            dataQualityText: dataQualityMessage(summary: summary),
+            officialUsageText: officialUsageMessage(summary: summary),
+            isEstimateAvailable: true,
+            availabilityMessageText: nil,
             totalRow: Row(
                 id: "total",
                 label: "Total",
@@ -91,6 +115,65 @@ struct CodexUsageSnapshot: Sendable {
             todayMenuBarBadgeText: partialPrefix(hasGaps: hasTodayGaps)
                 + trailingDollarCompactCurrency(todayTotalUSD)
         )
+    }
+
+    private static func legacyPlaceholder(summary: SummaryDocument) -> CodexUsageSnapshot {
+        unavailablePlaceholder(
+            recordedPeriodText: "Legacy ledger through \(summary.latestRecordedDate)",
+            estimateNoticeText: estimateNotice(summary: summary),
+            availabilityMessageText: "Codex ledger rebuild required",
+            dataQualityText: dataQualityMessage(summary: summary)
+        )
+    }
+
+    private static func unavailablePlaceholder(
+        recordedPeriodText: String,
+        estimateNoticeText: String,
+        availabilityMessageText: String,
+        dataQualityText: String?
+    ) -> CodexUsageSnapshot {
+        let placeholderRow = Row(
+            id: "total",
+            label: "Total",
+            allTime: "—",
+            monthToDate: "—",
+            yesterday: "—",
+            today: "—",
+            sparkline: ""
+        )
+
+        return CodexUsageSnapshot(
+            recordedPeriodText: recordedPeriodText,
+            estimateNoticeText: estimateNoticeText,
+            partialDataText: nil,
+            modelSummaryText: nil,
+            dataQualityText: dataQualityText,
+            officialUsageText: nil,
+            isEstimateAvailable: false,
+            availabilityMessageText: availabilityMessageText,
+            totalRow: placeholderRow,
+            hostRows: [],
+            menuBarBadgeText: "TinkerBar",
+            todayMenuBarBadgeText: "TinkerBar"
+        )
+    }
+
+    private static func ledgerIntegrityIsValid(
+        summary: SummaryDocument,
+        aggregation: LedgerAggregation
+    ) -> Bool {
+        guard
+            aggregation.wasLoaded,
+            aggregation.invalidRowCount == 0,
+            !aggregation.hasMissingGeneration,
+            let generation = summary.ledgerGeneration,
+            !generation.isEmpty,
+            summary.rows == aggregation.rowCount
+        else {
+            return false
+        }
+
+        return aggregation.generations.isEmpty || aggregation.generations == [generation]
     }
 
     private static func resolvedYesterday(
@@ -185,6 +268,84 @@ struct CodexUsageSnapshot: Sendable {
         return "Partial data; unavailable: \(description)"
     }
 
+    private static func estimateNotice(summary: SummaryDocument) -> String {
+        guard summary.ledgerSchemaVersion == 2 else {
+            return "Legacy estimate; a unified ccusage v20 rebuild is required."
+        }
+
+        let version = summary.collector?.version.map { " \($0)" } ?? ""
+        let tier = summary.collector?.speed?.capitalized ?? "Standard"
+        return "Estimated \(tier)-tier API-equivalent cost via ccusage\(version); not billed spend."
+    }
+
+    private static func modelSummary(summary: SummaryDocument) -> String? {
+        guard let models = summary.models?.observedRecent, !models.isEmpty else { return nil }
+        return "Recent models: \(models.sorted().joined(separator: ", "))"
+    }
+
+    private static func dataQualityMessage(summary: SummaryDocument) -> String? {
+        var messages: [String] = []
+
+        if summary.ledgerSchemaVersion != 2 {
+            messages.append("Ledger requires a v20 rebuild")
+        }
+
+        if summary.models?.catalogAvailable == false {
+            messages.append("Current Codex model catalog unavailable")
+        }
+
+        if let models = summary.models?.notInCurrentCatalog, !models.isEmpty {
+            messages.append("Local usage not in this Mac's current Codex catalog: \(models.sorted().joined(separator: ", "))")
+        }
+
+        if let models = summary.models?.fallbackAttributed, !models.isEmpty {
+            messages.append("Fallback-attributed usage: \(models.sorted().joined(separator: ", "))")
+        }
+
+        if let rows = summary.models?.possiblyUnpricedRows, !rows.isEmpty {
+            let label = rows.count == 1 ? "row" : "rows"
+            messages.append("\(rows.count) usage \(label) may be unpriced")
+        }
+
+        if let warning = summary.official?.probeWarning, !warning.isEmpty {
+            messages.append(warning)
+        }
+
+        return messages.isEmpty ? nil : messages.joined(separator: " • ")
+    }
+
+    private static func officialUsageMessage(summary: SummaryDocument) -> String? {
+        guard
+            summary.official?.accountUsage?.available == true,
+            let bucket = summary.official?.accountUsage?.dailyUsageBuckets?
+                .compactMap({ bucket -> (startDate: String, tokens: Int64)? in
+                    guard let startDate = bucket.startDate, let tokens = bucket.tokens else {
+                        return nil
+                    }
+                    return (startDate, tokens)
+                })
+                .max(by: { $0.startDate < $1.startDate })
+        else {
+            return nil
+        }
+
+        return "Official account activity: \(compactTokenCount(bucket.tokens)) tokens on \(bucket.startDate)"
+    }
+
+    private static func compactTokenCount(_ count: Int64) -> String {
+        let value = Double(count)
+        if count >= 1_000_000_000 {
+            return String(format: "%.2fB", value / 1_000_000_000)
+        }
+        if count >= 1_000_000 {
+            return String(format: "%.1fM", value / 1_000_000)
+        }
+        if count >= 1_000 {
+            return String(format: "%.1fK", value / 1_000)
+        }
+        return "\(count)"
+    }
+
     private static func hostDisplayName(_ host: String) -> String {
         host == "local" ? "MacBook" : host.capitalized
     }
@@ -252,12 +413,21 @@ struct CodexUsageSnapshot: Sendable {
 
         let decoder = JSONDecoder()
         var aggregation = LedgerAggregation()
+        aggregation.wasLoaded = true
 
         ledgerText.enumerateLines { line, _ in
+            guard !line.isEmpty else { return }
             guard let row = try? decoder.decode(LedgerRow.self, from: Data(line.utf8)) else {
+                aggregation.invalidRowCount += 1
                 return
             }
 
+            aggregation.rowCount += 1
+            if let generation = row.ledgerGeneration, !generation.isEmpty {
+                aggregation.generations.insert(generation)
+            } else {
+                aggregation.hasMissingGeneration = true
+            }
             aggregation.allTimeTotalUSD += row.costUSD
             aggregation.dates.insert(row.date)
             aggregation.hosts.insert(row.host)
@@ -309,6 +479,11 @@ struct CodexUsageSnapshot: Sendable {
 }
 
 private struct LedgerAggregation {
+    var wasLoaded = false
+    var rowCount = 0
+    var invalidRowCount = 0
+    var generations: Set<String> = []
+    var hasMissingGeneration = false
     var earliestRecordedDate: String?
     var allTimeTotalUSD = 0.0
     var dates: Set<String> = []
@@ -328,6 +503,84 @@ private struct HostCost {
 }
 
 private struct SummaryDocument: Decodable {
+    struct Collector: Decodable {
+        let version: String?
+        let speed: String?
+    }
+
+    struct ModelDiagnostics: Decodable {
+        struct PossiblyUnpricedRow: Decodable {}
+
+        let observedRecent: [String]?
+        let catalogAvailable: Bool?
+        let notInCurrentCatalog: [String]?
+        let fallbackAttributed: [String]?
+        let possiblyUnpricedRows: [PossiblyUnpricedRow]?
+    }
+
+    struct OfficialSnapshot: Decodable {
+        struct AccountUsage: Decodable {
+            struct DailyUsageBucket: Decodable {
+                let startDate: String?
+                let tokens: Int64?
+
+                private enum CodingKeys: String, CodingKey {
+                    case startDate
+                    case tokens
+                }
+
+                init(from decoder: Decoder) throws {
+                    guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+                        startDate = nil
+                        tokens = nil
+                        return
+                    }
+                    startDate = try? container.decode(String.self, forKey: .startDate)
+                    tokens = try? container.decode(Int64.self, forKey: .tokens)
+                }
+            }
+
+            let available: Bool
+            let dailyUsageBuckets: [DailyUsageBucket]?
+
+            private enum CodingKeys: String, CodingKey {
+                case available
+                case dailyUsageBuckets
+            }
+
+            init(from decoder: Decoder) throws {
+                guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+                    available = false
+                    dailyUsageBuckets = nil
+                    return
+                }
+                available = (try? container.decode(Bool.self, forKey: .available)) ?? false
+                dailyUsageBuckets = try? container.decode(
+                    [DailyUsageBucket].self,
+                    forKey: .dailyUsageBuckets
+                )
+            }
+        }
+
+        let probeWarning: String?
+        let accountUsage: AccountUsage?
+
+        private enum CodingKeys: String, CodingKey {
+            case probeWarning
+            case accountUsage
+        }
+
+        init(from decoder: Decoder) throws {
+            guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+                probeWarning = nil
+                accountUsage = nil
+                return
+            }
+            probeWarning = try? container.decode(String.self, forKey: .probeWarning)
+            accountUsage = try? container.decode(AccountUsage.self, forKey: .accountUsage)
+        }
+    }
+
     struct Collection: Decodable {
         let expectedHosts: [String]
         let historicalFailedHosts: [String]
@@ -355,6 +608,12 @@ private struct SummaryDocument: Decodable {
     }
 
     let timezone: String
+    let ledgerSchemaVersion: Int?
+    let ledgerGeneration: String?
+    let rows: Int?
+    let collector: Collector?
+    let models: ModelDiagnostics?
+    let official: OfficialSnapshot?
     let latestRecordedDate: String
     let collection: Collection?
     let monthToDate: MonthToDate
@@ -364,6 +623,7 @@ private struct SummaryDocument: Decodable {
 }
 
 private struct LedgerRow: Decodable {
+    let ledgerGeneration: String?
     let date: String
     let host: String
     let costUSD: Double

@@ -3,29 +3,42 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var runtime: AutomationRuntime
-    @Binding var showsTodaySpendingInMenuBar: Bool
+    @Binding var showsTodayEstimateInMenuBar: Bool
 
     var body: some View {
         Group {
             Text(runtime.summaryText)
 
             if let usage = runtime.codexUsageSnapshot {
-                Text("Codex \(usage.totalRow.today) today")
-
-                Text("All time \(usage.totalRow.allTime)")
+                if usage.isEstimateAvailable {
+                    Text("Codex est. \(usage.totalRow.today) today")
+                    Text("Est. all time \(usage.totalRow.allTime)")
+                } else if let availabilityMessageText = usage.availabilityMessageText {
+                    Text(availabilityMessageText)
+                }
             }
 
             Text(runtime.quietModeStatusText)
 
-            Toggle("Show Today in Menu Bar", isOn: $showsTodaySpendingInMenuBar)
-                .disabled(runtime.codexUsageSnapshot == nil)
+            Toggle("Show Today Estimate in Menu Bar", isOn: $showsTodayEstimateInMenuBar)
+                .disabled(runtime.codexUsageSnapshot?.isEstimateAvailable != true)
 
             ForEach(runtime.tasks) { task in
                 Menu(task.configuration.name) {
                     if let usage = task.snapshot.codexUsage {
                         Text(usage.recordedPeriodText)
+                        Text(usage.estimateNoticeText)
                         if let partialDataText = usage.partialDataText {
                             Text(partialDataText)
+                        }
+                        if let modelSummaryText = usage.modelSummaryText {
+                            Text(modelSummaryText)
+                        }
+                        if let officialUsageText = usage.officialUsageText {
+                            Text(officialUsageText)
+                        }
+                        if let dataQualityText = usage.dataQualityText {
+                            Text(dataQualityText)
                         }
                         usageTableLine(usageTableHeader())
                         usageTableLine(usageTableRow(usage.totalRow))
