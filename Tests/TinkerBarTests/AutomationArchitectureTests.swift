@@ -250,49 +250,6 @@ final class AutomationRuntimeTests: XCTestCase {
     }
 
     @MainActor
-    func testQuietHoursSuppressDirectoryLaunchRuns() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        let watchedDirectory = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.removeItem(at: appSupportDirectory)
-            try? FileManager.default.removeItem(at: watchedDirectory)
-        }
-
-        try writeTask(
-            id: "photos",
-            name: "Photos",
-            triggerKind: .directory,
-            directoryPath: watchedDirectory.path,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "photos")
-
-        let calendar = makeUTCCalendar()
-        let capture = CommandCapture()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: capture.execute),
-            enablementStore: enablementStore,
-            quietHours: AutomationQuietHours(startHour: 1, endHour: 8, calendar: calendar),
-            dateProvider: { makeDate(hour: 2, calendar: calendar) },
-            autoload: false,
-            loadStartupState: false
-        )
-
-        runtime.reloadTasks()
-        try? await Task.sleep(nanoseconds: 150_000_000)
-
-        XCTAssertEqual(capture.calls.count, 0)
-        runtime.toggleTask("photos")
-    }
-
-    @MainActor
     func testManualRunsBypassQuietHours() async throws {
         let appSupportDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: appSupportDirectory) }

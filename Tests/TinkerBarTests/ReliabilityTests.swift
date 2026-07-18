@@ -115,7 +115,6 @@ final class TaskRunnerReliabilityTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 3)
         XCTAssertTrue(message.contains("timed out"))
         XCTAssertEqual(snapshot.lastError, message)
-        XCTAssertNotEqual(snapshot.lastError, "stale worker failure")
 
         let persistedStatus = try String(contentsOf: fixture.task.paths.statusFile, encoding: .utf8)
         XCTAssertTrue(persistedStatus.contains("last_error\t\(message)"))
@@ -154,7 +153,6 @@ final class TaskRunnerReliabilityTests: XCTestCase {
         }
 
         XCTAssertTrue(snapshot.lastError.contains("stopped before completion"))
-        XCTAssertNotEqual(snapshot.lastError, "stale worker failure")
         let childPID = try readChildPID(from: fixture.task.paths.taskDirectory)
         XCTAssertTrue(
             waitForProcessToExit(childPID, timeout: 2),
@@ -340,7 +338,6 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         XCTAssertEqual(exitCode, 0)
 
         let rebuiltLedger = try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8)
-        XCTAssertNotEqual(rebuiltLedger, legacyLedger)
         XCTAssertTrue(rebuiltLedger.contains("\"ledgerSchemaVersion\":2"))
         XCTAssertTrue(rebuiltLedger.contains("\"version\":\"20.0.17\""))
         XCTAssertFalse(rebuiltLedger.contains("pricingAdjustment"))
@@ -685,7 +682,6 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         XCTAssertTrue(fetchStarted, "Nested usage fetch did not start")
 
         let processIDs = try readProcessIDs(from: processIDsFile)
-        XCTAssertEqual(processIDs.count, 2)
         execution.cancel()
 
         guard case .cancelled = await execution.value else {

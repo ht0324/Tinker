@@ -7,24 +7,25 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            Text(runtime.summaryText)
+            Text(menuItemTitle(runtime.summaryText))
 
             if let usage = runtime.codexUsageSnapshot {
                 if usage.isEstimateAvailable {
-                    Text("Codex est. \(usage.totalRow.today) today")
-                    Text("Est. all time \(usage.totalRow.allTime)")
+                    Text(menuItemTitle("Codex est. \(usage.totalRow.today) today"))
+                    Text(menuItemTitle("Est. all time \(usage.totalRow.allTime)"))
                 } else if let availabilityMessageText = usage.availabilityMessageText {
-                    Text(availabilityMessageText)
+                    Text(menuItemTitle(availabilityMessageText))
                 }
             }
 
-            Text(runtime.quietModeStatusText)
+            Text(menuItemTitle(runtime.quietModeStatusText))
 
-            Toggle("Show Today Estimate in Menu Bar", isOn: $showsTodayEstimateInMenuBar)
+            Toggle("Show Today Estimate", isOn: $showsTodayEstimateInMenuBar)
                 .disabled(runtime.codexUsageSnapshot?.isEstimateAvailable != true)
+                .accessibilityLabel("Show Today Estimate in Menu Bar")
 
             ForEach(runtime.tasks) { task in
-                Menu(task.configuration.name) {
+                Menu(menuItemTitle(task.configuration.name)) {
                     if let usage = task.snapshot.codexUsage {
                         Text(usage.recordedPeriodText)
                         Text(usage.estimateNoticeText)
@@ -114,7 +115,7 @@ struct ContentView: View {
             .disabled(runtime.isBusy)
 
             if !runtime.message.isEmpty {
-                Text(runtime.message)
+                Text(menuItemTitle(runtime.message))
             }
 
             Divider()
@@ -130,6 +131,10 @@ struct ContentView: View {
         .onAppear {
             runtime.menuDidAppear()
         }
+    }
+
+    private func menuItemTitle(_ value: String) -> String {
+        MenuItemTitleFormatter.string(from: value)
     }
 
     private func usageTableLine(_ value: String) -> some View {
