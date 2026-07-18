@@ -13,8 +13,12 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "TinkerBar",
+            exclude: [
+                "Resources/AppIcon.icns",
+                "Resources/AppIcon.png",
+            ],
             resources: [
-                .process("Resources"),
+                .process("Resources/BuiltinTasks"),
             ]
         ),
         .testTarget(

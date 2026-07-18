@@ -10,7 +10,6 @@ struct TaskCatalog {
     private let builtInTasks: BuiltinTaskInstaller
     private let installsBuiltInTasks: Bool
 
-    let appSupportDirectory: URL
     let tasksDirectory: URL
 
     init(
@@ -36,7 +35,6 @@ struct TaskCatalog {
         builtInTasks: BuiltinTaskInstaller = BuiltinTaskInstaller(),
         installsBuiltInTasks: Bool = true
     ) {
-        self.appSupportDirectory = appSupportDirectory
         self.tasksDirectory = appSupportDirectory.appendingPathComponent("tasks", isDirectory: true)
         self.fileManager = fileManager
         self.builtInTasks = builtInTasks

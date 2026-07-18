@@ -1,7 +1,7 @@
 import Foundation
 
 struct CodexUsageSnapshot: Sendable {
-    struct Row: Identifiable, Equatable, Sendable {
+    struct Row: Identifiable, Sendable {
         let id: String
         let label: String
         let allTime: String

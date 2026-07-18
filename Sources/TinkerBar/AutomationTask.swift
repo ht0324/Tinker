@@ -12,7 +12,7 @@ enum ApplicationTriggerEvent: String, Sendable {
     case sync
 }
 
-struct AutomationTaskConfiguration: Codable, Identifiable, Sendable {
+struct AutomationTaskConfiguration: Codable, Sendable {
     var id: String
     var name: String
     var detail: String
@@ -108,7 +108,6 @@ struct AutomationTaskSnapshot: Sendable {
     var filesInstalled = false
     var lastRunISO = ""
     var lastSuccessISO = ""
-    var successCount = 0
     var lastOutput = ""
     var lastError = ""
     var codexUsage: CodexUsageSnapshot?

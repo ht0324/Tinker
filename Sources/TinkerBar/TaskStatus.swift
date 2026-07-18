@@ -55,7 +55,7 @@ enum TaskStatusStore {
         return Document(contents: contents)
     }
 
-    private static func sanitizedStatusValue(_ value: String) -> String {
+    static func sanitizedStatusValue(_ value: String) -> String {
         let singleLine = value
             .replacingOccurrences(of: "\t", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
@@ -132,7 +132,7 @@ enum TaskStatusStore {
                 case .lastSuccess:
                     snapshot.lastSuccessISO = entry.value
                 case .successCount:
-                    snapshot.successCount = Int(entry.value) ?? 0
+                    break
                 case .lastOutput:
                     snapshot.lastOutput = entry.value
                 case .lastError:

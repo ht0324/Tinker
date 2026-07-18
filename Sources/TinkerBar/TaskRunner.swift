@@ -180,11 +180,11 @@ struct TaskRunner: @unchecked Sendable {
         }
 
         if let stderr = nonEmpty(commandResult.stderr) {
-            return sanitizedStatusValue(stderr, maxLength: 512)
+            return TaskStatusStore.sanitizedStatusValue(stderr)
         }
 
         if let stdout = nonEmpty(commandResult.stdout) {
-            return sanitizedStatusValue(stdout, maxLength: 512)
+            return TaskStatusStore.sanitizedStatusValue(stdout)
         }
 
         return fallback
@@ -219,14 +219,6 @@ struct TaskRunner: @unchecked Sendable {
             for: task.paths,
             fileManager: fileManager
         )
-    }
-
-    private func sanitizedStatusValue(_ value: String, maxLength: Int) -> String {
-        let singleLine = value
-            .replacingOccurrences(of: "\t", with: " ")
-            .replacingOccurrences(of: "\r", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-        return String(singleLine.prefix(maxLength))
     }
 
     private func nonEmpty(_ value: String) -> String? {

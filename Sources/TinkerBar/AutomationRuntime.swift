@@ -13,7 +13,7 @@ enum AutomationError: LocalizedError {
     }
 }
 
-enum TaskRunRequestSource: Equatable, Sendable {
+enum TaskRunRequestSource: Sendable {
     case manual
     case directory
     case interval

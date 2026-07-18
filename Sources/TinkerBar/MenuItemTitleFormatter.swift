@@ -1,7 +1,5 @@
-import Foundation
-
 enum MenuItemTitleFormatter {
-    static let maximumCharacterCount = 30
+    private static let maximumCharacterCount = 30
 
     static func string(from value: String) -> String {
         let singleLineValue = value

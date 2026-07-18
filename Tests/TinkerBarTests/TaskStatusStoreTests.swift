@@ -39,7 +39,6 @@ final class TaskStatusStoreTests: XCTestCase {
         XCTAssertFalse(snapshot.filesInstalled)
         XCTAssertEqual(snapshot.lastRunISO, "2026-07-10T12:00:00Z")
         XCTAssertEqual(snapshot.lastSuccessISO, "2026-07-10T11:00:00Z")
-        XCTAssertEqual(snapshot.successCount, 0)
         XCTAssertEqual(snapshot.lastOutput, "value\twith\ttabs")
         XCTAssertEqual(snapshot.lastError, "worker failed")
 
@@ -93,7 +92,6 @@ final class TaskStatusStoreTests: XCTestCase {
         var current = AutomationTaskSnapshot()
         current.lastRunISO = "keep-run"
         current.lastSuccessISO = "keep-success"
-        current.successCount = 9
         current.lastOutput = "keep-output"
 
         let snapshot = TaskStatusStore.recordingRunnerError(
@@ -104,7 +102,6 @@ final class TaskStatusStoreTests: XCTestCase {
 
         XCTAssertEqual(snapshot.lastRunISO, "keep-run")
         XCTAssertEqual(snapshot.lastSuccessISO, "keep-success")
-        XCTAssertEqual(snapshot.successCount, 9)
         XCTAssertEqual(snapshot.lastOutput, "keep-output")
         XCTAssertEqual(snapshot.lastError, "new error message")
     }
