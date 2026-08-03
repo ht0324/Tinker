@@ -6,32 +6,25 @@
 
 TinkerBar is a small macOS menu bar app for personal automations that are too useful to forget, but too small to deserve a whole app of their own.
 
-It watches a folder of task definitions, shows their status in the menu bar, and runs each task's `run.sh` on a schedule, when files appear in a watched folder, or when a configured app opens or quits. The app handles the menu, triggers, launch-at-login, status refreshes, and log shortcuts; each worker stays as a plain shell script that is easy to read, replace, or delete.
+Each automation lives in a folder with a `task.json` file and a `run.sh` script. TinkerBar runs the script when a folder changes, a timer fires, or an app opens or quits. From the menu bar, you can turn tasks on and off, run or stop them by hand, and open their folders and logs.
 
-## Highlights
+The workers remain ordinary shell scripts, so they are easy to inspect, replace, or delete.
 
-- Menu bar controls for turning tasks on or off, running them manually, and opening their folders or logs.
-- Folder-triggered tasks for workflows like converting new camera files.
-- Interval-triggered tasks for recurring maintenance jobs.
-- Application-triggered tasks for reacting to app launches and quits.
-- File-based task folders, so custom automations are easy to inspect and move around.
-- Quiet overnight behavior for automatic runs, while manual runs still work when you ask for them.
-- No third-party watcher daemon or long-running shell script hidden in the background.
+## How it works
 
-## Built-In Tasks
+TinkerBar discovers sibling task folders under:
 
-TinkerBar currently ships with four example tasks:
+```text
+~/Library/Application Support/TinkerBar/tasks/
+```
 
-- `heic-to-jpeg`: converts new HEIC or HEIF files in a watched folder to JPEG.
-- `codex-update`: periodically updates the global Codex CLI with npm.
-- `codex-usage-ledger`: records estimated Standard-tier API-equivalent Codex cost into a local ledger and summary file. Remote hosts are optional and configured outside the repo.
-- `parsec-macmini-mirror`: mirrors local Parsec launch and quit events to a configured Mac mini.
+It supports folder, interval, and application triggers. TinkerBar owns the scheduling and worker lifecycle, including status refreshes, a 30-minute deadline, cancellation, and process cleanup. Each task keeps its current state in `status.tsv` and writes worker output to `task.log`.
 
-Each built-in task is installed into the same task-folder format that custom tasks use.
+Directory and interval tasks wait during quiet hours, from 1:00 to 8:00 a.m. Manual runs and application events still work during that time.
 
-## Getting Started
+## Getting started
 
-Clone the repo, then run the app from the project root:
+TinkerBar requires macOS 13 or later and a Swift 6 toolchain. Clone the repository and run it from the project root:
 
 ```bash
 swift run
@@ -44,71 +37,51 @@ To build a standalone app bundle:
 open dist/TinkerBar.app
 ```
 
-The build command uses the repo's strict release settings, removes macOS
-metadata that interferes with signing, then ad-hoc signs the local bundle and
-strictly verifies a clean restaging of the published artifact. To build, safely
-replace the copy in `~/Applications`, relaunch it, and verify the running
-executable in one command:
+For a local install, the build script can replace the copy in `~/Applications`, relaunch it, and verify the running executable:
 
 ```bash
 ./scripts/build-app.sh --install
 ```
 
-Set `TINKERBAR_INSTALL_DIR` if you intentionally use a different local install
-directory. This is a local development signature; distributing the app to
-other Macs would additionally require a Developer ID signature and notarization.
+Set `TINKERBAR_INSTALL_DIR` if you use a different local install directory. The bundle is ad-hoc signed for local use; distribution to other Macs requires Developer ID signing and notarization.
 
-From the menu bar, use `Reload Tasks` after editing task files, `Open Tasks Folder` to inspect the live task directory, and `Start at Login` if you want TinkerBar to keep working after you restart your Mac.
+Use `Reload Tasks` after editing a task, `Open Tasks Folder` to inspect the live files, and `Start at Login` if you want TinkerBar to launch with macOS.
 
-## Task Folders
+## Built-in tasks
 
-Runtime task data lives outside the repo:
+TinkerBar started as a home for a few automations I use on my own Macs, so the bundled tasks are intentionally specific:
+
+- `heic-to-jpeg` converts new HEIC or HEIF files in a watched folder to JPEG.
+- `codex-update` periodically updates the global Codex CLI with npm.
+- `codex-usage-ledger` records estimated Standard-tier API-equivalent Codex cost locally and can collect from configured remote hosts.
+- `parsec-macmini-mirror` mirrors local Parsec launch and quit events to a configured Mac mini.
+
+On first launch, TinkerBar creates these four task folders. They begin turned off, so nothing runs until you enable it from the menu. Built-in tasks use the same folder format as custom tasks.
+
+## Creating a task
+
+A task folder contains two files you provide and two files TinkerBar maintains:
 
 ```text
-~/Library/Application Support/TinkerBar/tasks/
-  heic-to-jpeg/
-    task.json
-    run.sh
-    status.tsv
-    task.log
-  codex-update/
-    task.json
-    run.sh
-    status.tsv
-    task.log
-  codex-usage-ledger/
-    task.json
-    run.sh
-    codex-usage-app-server.mjs
-    ledger.jsonl
-    latest-summary.json
-    official-usage.json
-    status.tsv
-    task.log
-  parsec-macmini-mirror/
-    task.json
-    run.sh
-    status.tsv
-    task.log
+my-task/
+  task.json
+  run.sh
+  status.tsv
+  task.log
 ```
 
-The app discovers sibling folders under `tasks/`. The task contract is:
+- `task.json` describes the task and its trigger.
+- `run.sh` is the worker script.
+- `status.tsv` stores the latest run state.
+- `task.log` stores worker output.
 
-- `task.json` describing the task.
-- `run.sh` containing the worker script.
-- `status.tsv` is created and maintained for the latest run state.
-- `task.log` is written or opened on demand for worker output.
-
-## Task Configuration
-
-A folder-triggered task looks like this:
+For example, a folder-triggered task can use this configuration:
 
 ```json
 {
-  "id": "heic-to-jpeg",
-  "name": "HEIC to JPEG",
-  "detail": "Convert new HEIC and HEIF files in a folder to JPEG.",
-  "scriptKind": "heic_to_jpeg",
+  "id": "downloads-cleanup",
+  "name": "Downloads cleanup",
+  "detail": "Organize new files in Downloads.",
   "triggerKind": "directory",
   "directoryPath": "~/Downloads",
   "openPath": "~/Downloads"
@@ -117,43 +90,29 @@ A folder-triggered task looks like this:
 
 Supported trigger kinds:
 
-- `directory`: runs when new regular files appear in `directoryPath`.
-- `interval`: runs every `intervalSeconds`.
-- `application`: runs when the configured `applicationName` or
-  `bundleIdentifier` opens or quits.
+- `directory` runs when new regular files appear in `directoryPath`.
+- `interval` runs every `intervalSeconds`.
+- `application` runs when the configured `applicationName` or `bundleIdentifier` opens or quits.
 
-Script argument contracts:
+TinkerBar calls each script with arguments for its trigger type:
 
-- Directory task: `run.sh <directoryPath> <statusFile> <logFile>`
-- Interval task: `run.sh <statusFile> <logFile>`
-- Application task: `run.sh <opened|closed|sync> <statusFile> <logFile>`
+```text
+Directory:   run.sh <directoryPath> <statusFile> <logFile>
+Interval:    run.sh <statusFile> <logFile>
+Application: run.sh <opened|closed|sync> <statusFile> <logFile>
+```
 
-Worker runs have a 30-minute deadline and can be stopped from the task menu. TinkerBar treats either a nonzero exit status or a nonempty `last_error` status value as a failed run, and records runner-level failures such as timeouts in `status.tsv`.
+A nonzero exit status or a nonempty `last_error` value marks the run as failed. TinkerBar also records runner-level failures such as timeouts in `status.tsv`.
 
-## Private Task Config
+## Private task configuration
 
-The bundled Codex usage task reads an optional private env file from its runtime task folder:
+Keep secrets and machine-specific values outside the repository. The Codex usage task, for example, reads an optional `config.env` from its runtime folder:
 
 ```text
 ~/Library/Application Support/TinkerBar/tasks/codex-usage-ledger/config.env
 ```
 
-Example:
-
-```zsh
-TINKERBAR_CODEX_USAGE_REMOTE_HOSTS="workstation server"
-TINKERBAR_CODEX_USAGE_TIMEZONE="America/Los_Angeles"
-```
-
-Keep that file out of Git. You can also point at another private config path with `TINKERBAR_CODEX_USAGE_CONFIG_FILE`.
-
-### Codex usage estimates
-
-The usage worker runs the unified, pinned `ccusage@20.0.17` collector through `npx` on each configured host. The first run may therefore take longer while npm fetches the pinned package; no global ccusage installation is required. The ccusage process uses its embedded offline pricing data, while `npx` may still contact npm to obtain the pinned package. Standard-tier pricing is fixed explicitly so a host's current Fast or Priority setting cannot retroactively change historical estimates.
-
-The ledger stores the model breakdown returned by ccusage, including current model IDs such as `gpt-5.6-sol`, and marks fallback-attributed or potentially unpriced rows in `latest-summary.json`. A local, best-effort Codex App Server probe also records the current official model catalog and aggregate account activity as a reference. That official data has no per-host or per-model dollar breakdown, so it does not replace the ccusage estimate.
-
-These dollar figures are API-equivalent estimates, not invoices or measured ChatGPT/Codex subscription spend. When the ledger schema or pinned collector version changes, TinkerBar rebuilds the history into temporary files and switches them in only after historical collection succeeds for every configured host and the replacement summary validates. The ledger and summary share a generation ID, so the app suppresses estimates rather than combining mismatched generations after an interrupted switch. The prior ledger and summary receive timestamped `.bak` copies after a successful migration; a failed migration leaves the originals untouched.
+See [Codex usage ledger](docs/codex-usage.md) for configuration and an explanation of the estimates.
 
 ## Development
 
@@ -169,4 +128,4 @@ swift run
 ./scripts/build-app.sh --install
 ```
 
-For behavior changes, build the app, launch it, and exercise the affected task from the menu bar. For task-format changes, verify the relevant directory, interval, or application task argument contract.
+For behavior changes, build the app and exercise the affected task from the menu bar. For task-format changes, verify the relevant directory, interval, or application script contract.
