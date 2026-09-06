@@ -45,7 +45,7 @@ struct TaskCatalog {
         try fileManager.createDirectory(at: tasksDirectory, withIntermediateDirectories: true)
 
         if installsBuiltInTasks {
-            try builtInTasks.installDefaultTasksIfNeeded(tasksDirectory: tasksDirectory)
+            try builtInTasks.installDefaultConfigurationsIfNeeded(tasksDirectory: tasksDirectory)
         }
 
         let folderURLs = try fileManager.contentsOfDirectory(

@@ -4,7 +4,7 @@ struct BuiltinTaskInstaller {
     private static let codexUsageAppServerHelperFileName = "codex-usage-app-server.mjs"
     private let fileManager = FileManager.default
 
-    func installDefaultTasksIfNeeded(tasksDirectory: URL) throws {
+    func installDefaultConfigurationsIfNeeded(tasksDirectory: URL) throws {
         for configuration in defaultTaskConfigurations {
             let paths = AutomationTaskPaths(taskDirectory: tasksDirectory.appendingPathComponent(configuration.id, isDirectory: true))
             try fileManager.createDirectory(at: paths.taskDirectory, withIntermediateDirectories: true)
@@ -14,14 +14,10 @@ struct BuiltinTaskInstaller {
             } else {
                 try migrateConfigurationIfNeeded(defaultConfiguration: configuration, paths: paths)
             }
-
-            try ensureSupportFiles(for: configuration, paths: paths)
         }
     }
 
     func ensureSupportFiles(for configuration: AutomationTaskConfiguration, paths: AutomationTaskPaths) throws {
-        try fileManager.createDirectory(at: paths.taskDirectory, withIntermediateDirectories: true)
-
         if let contents = try builtinScriptContents(for: configuration) {
             try writeIfChanged(contents: contents, to: paths.scriptFile)
         } else if !fileManager.fileExists(atPath: paths.scriptFile.path) {
@@ -30,7 +26,7 @@ struct BuiltinTaskInstaller {
 
         try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.scriptFile.path)
 
-        if configuration.id == "codex-usage-ledger" {
+        if configuration.scriptKind == "codex_usage_ledger" {
             guard let helperURL = Bundle.module.url(
                 forResource: "codex_usage_app_server",
                 withExtension: "mjs"
@@ -63,26 +59,21 @@ struct BuiltinTaskInstaller {
         }
         guard configuration.id == defaultConfiguration.id else { return }
 
-        var changed = false
         let oldDetailPrefix = "Track Codex spend"
-        let detailSuffix = configuration.detail.dropFirst(
-            min(oldDetailPrefix.count, configuration.detail.count)
-        )
-        if configuration.detail.hasPrefix(oldDetailPrefix),
-           detailSuffix.isEmpty || detailSuffix.first?.isWhitespace == true {
-            configuration.detail = "Track estimated Codex API-equivalent cost"
-                + detailSuffix
-            changed = true
+        let detailSuffix = configuration.detail.dropFirst(oldDetailPrefix.count)
+        guard configuration.detail.hasPrefix(oldDetailPrefix),
+              detailSuffix.isEmpty || detailSuffix.first?.isWhitespace == true else {
+            return
         }
 
+        // Only the legacy configuration opts into this migration. An absent
+        // scriptKind otherwise means the user owns run.sh.
+        configuration.detail = "Track estimated Codex API-equivalent cost" + detailSuffix
         if configuration.scriptKind == nil {
             configuration.scriptKind = defaultConfiguration.scriptKind
-            changed = true
         }
 
-        if changed {
-            try writeConfiguration(configuration, to: paths.configFile)
-        }
+        try writeConfiguration(configuration, to: paths.configFile)
     }
 
     private func builtinScriptContents(for configuration: AutomationTaskConfiguration) throws -> String? {

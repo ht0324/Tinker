@@ -58,6 +58,8 @@ TinkerBar started as a home for a few automations I use on my own Macs, so the b
 
 On first launch, TinkerBar creates these four task folders. They begin turned off, so nothing runs until you enable it from the menu. Built-in tasks use the same folder format as custom tasks.
 
+The optional `scriptKind` in `task.json` selects a bundled worker, such as `codex_update`, that TinkerBar refreshes on reload. Remove `scriptKind` when replacing a bundled worker with your own `run.sh`.
+
 ## Creating a task
 
 A task folder contains two files you provide and two files TinkerBar maintains:

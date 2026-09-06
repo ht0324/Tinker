@@ -454,14 +454,13 @@ final class AutomationRuntime: ObservableObject {
         case .interval:
             let schedulingToken = activateScheduling(lifecycle)
             let intervalSeconds = intervalSeconds(for: task.configuration)
-            let launchPlan = intervalLaunchPlan(
+            let initialDelay = initialIntervalDelay(
                 for: task,
                 startMode: startMode,
                 intervalSeconds: intervalSeconds,
                 now: dateProvider()
             )
 
-            let firstDelay = launchPlan.shouldRunWhenReady ? intervalSeconds : launchPlan.initialDelaySeconds
             let eventHandler: @Sendable () -> Void = { [weak self] in
                 Task { @MainActor in
                     guard let self, self.isActiveScheduling(schedulingToken, for: taskID) else { return }
@@ -469,14 +468,14 @@ final class AutomationRuntime: ObservableObject {
                 }
             }
             let timer = Self.makeIntervalTimer(
-                firstDelay: firstDelay,
+                firstDelay: initialDelay == 0 ? intervalSeconds : initialDelay,
                 repeatDelay: intervalSeconds,
                 eventHandler: eventHandler
             )
             timer.resume()
             lifecycle.trigger = .interval(timer)
 
-            if launchPlan.shouldRunWhenReady {
+            if initialDelay == 0 {
                 requestTaskRun(taskID, source: .interval)
             }
         case .application:
@@ -637,32 +636,20 @@ final class AutomationRuntime: ObservableObject {
         max(configuration.intervalSeconds ?? 0, 1)
     }
 
-    private func intervalLaunchPlan(
+    private func initialIntervalDelay(
         for task: AutomationTaskState,
         startMode: TaskStartMode,
         intervalSeconds: Double,
         now: Date
-    ) -> IntervalLaunchPlan {
-        guard startMode != .manualEnable else {
-            return IntervalLaunchPlan(initialDelaySeconds: 0, shouldRunWhenReady: true)
-        }
+    ) -> Double {
+        guard startMode != .manualEnable else { return 0 }
 
         guard let lastRunDate = Self.iso8601Formatter.date(from: task.snapshot.lastRunISO) else {
-            return IntervalLaunchPlan(
-                initialDelaySeconds: intervalSeconds,
-                shouldRunWhenReady: false
-            )
+            return intervalSeconds
         }
 
         let elapsedSeconds = max(0, now.timeIntervalSince(lastRunDate))
-        guard elapsedSeconds < intervalSeconds else {
-            return IntervalLaunchPlan(initialDelaySeconds: 0, shouldRunWhenReady: true)
-        }
-
-        return IntervalLaunchPlan(
-            initialDelaySeconds: intervalSeconds - elapsedSeconds,
-            shouldRunWhenReady: false
-        )
+        return max(intervalSeconds - elapsedSeconds, 0)
     }
 
     nonisolated private static func dispatchInterval(for seconds: Double) -> DispatchTimeInterval {
@@ -845,11 +832,6 @@ final class AutomationRuntime: ObservableObject {
                 return false
             }
         }
-    }
-
-    private struct IntervalLaunchPlan {
-        let initialDelaySeconds: Double
-        let shouldRunWhenReady: Bool
     }
 
     private static let iso8601Formatter = ISO8601DateFormatter()

@@ -5,7 +5,7 @@ import XCTest
 @testable import TinkerBar
 
 final class TaskCatalogTests: XCTestCase {
-    func testBuiltInTaskOrderingShowsUsageBeforeUpdate() throws {
+    func testBuiltInTasksInstallAndRefreshInDisplayOrder() throws {
         let appSupportDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
 
@@ -13,6 +13,57 @@ final class TaskCatalogTests: XCTestCase {
         let tasks = try catalog.discoverTasks().tasks
 
         XCTAssertEqual(tasks.map(\.id), ["codex-usage-ledger", "codex-update", "heic-to-jpeg", "parsec-macmini-mirror"])
+        XCTAssertTrue(tasks.allSatisfy { $0.snapshot.filesInstalled })
+
+        let paths = try XCTUnwrap(tasks.first(where: { $0.id == "codex-update" })?.paths)
+        let bundledScript = try String(contentsOf: paths.scriptFile, encoding: .utf8)
+        try "outdated worker".write(to: paths.scriptFile, atomically: true, encoding: .utf8)
+
+        _ = try catalog.discoverTasks()
+        XCTAssertEqual(try String(contentsOf: paths.scriptFile, encoding: .utf8), bundledScript)
+    }
+
+    func testReloadPreservesCustomWorkersInBuiltInFolders() throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        let taskIDs = ["codex-update", "codex-usage-ledger", "heic-to-jpeg", "parsec-macmini-mirror"]
+        for id in taskIDs {
+            try writeTask(id: id, name: id, triggerKind: .interval, appSupportDirectory: appSupportDirectory)
+        }
+
+        let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory)
+        for _ in 0..<2 {
+            let tasks = try catalog.discoverTasks().tasks
+            XCTAssertEqual(Set(tasks.map(\.id)), Set(taskIDs))
+            for task in tasks {
+                XCTAssertNil(task.configuration.scriptKind)
+                XCTAssertEqual(try String(contentsOf: task.paths.scriptFile, encoding: .utf8), "#!/bin/zsh\nexit 0\n")
+                XCTAssertFalse(FileManager.default.fileExists(
+                    atPath: task.paths.taskDirectory.appendingPathComponent("codex-usage-app-server.mjs").path
+                ))
+            }
+        }
+    }
+
+    func testUsageWorkerInstallsItsHelperForACustomTaskID() throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        let paths = try writeTask(
+            id: "custom-usage", name: "Custom Usage", triggerKind: .interval,
+            appSupportDirectory: appSupportDirectory
+        )
+        var configuration = try loadConfiguration(from: paths.configFile)
+        configuration.scriptKind = "codex_usage_ledger"
+        try JSONEncoder().encode(configuration).write(to: paths.configFile)
+
+        let tasks = try TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false)
+            .discoverTasks().tasks
+        XCTAssertEqual(tasks.map(\.id), ["custom-usage"])
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: paths.taskDirectory.appendingPathComponent("codex-usage-app-server.mjs").path
+        ))
     }
 
     func testDiscoversCustomTaskFolderAndCreatesStatusFile() throws {
@@ -78,6 +129,7 @@ final class TaskCatalogTests: XCTestCase {
             ["codex-update", "heic-to-jpeg", "parsec-macmini-mirror"]
         )
         XCTAssertEqual(discovery.skippedFolders, ["codex-usage-ledger"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: brokenDirectory.appendingPathComponent("run.sh").path))
     }
 }
 
@@ -402,6 +454,48 @@ final class AutomationRuntimeTests: XCTestCase {
         executor.unblockFirstCall()
         let becameIdle = await executor.waitUntilIdle()
         XCTAssertTrue(becameIdle)
+    }
+
+    @MainActor
+    func testRecentIntervalRunWaitsOnReloadButRunsWhenEnabledManually() async throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+
+        let paths = try writeTask(
+            id: "usage", name: "Usage", triggerKind: .interval,
+            appSupportDirectory: appSupportDirectory
+        )
+        let now = makeDate(hour: 12, calendar: makeUTCCalendar())
+        try writeStatus(lastRun: now, to: paths.statusFile)
+
+        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let enablementStore = TaskEnablementStore(defaults: defaults)
+        enablementStore.setEnabled(true, taskID: "usage")
+
+        let capture = CommandCapture()
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+            runner: TaskRunner(commandExecutor: capture.execute),
+            enablementStore: enablementStore,
+            quietHours: AutomationQuietHours(startHour: 1, endHour: 8, calendar: makeUTCCalendar()),
+            dateProvider: { now },
+            autoload: false,
+            loadStartupState: false
+        )
+
+        runtime.reloadTasks()
+        XCTAssertFalse(try XCTUnwrap(runtime.tasks.first).isRunning)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(capture.calls.isEmpty)
+
+        runtime.toggleTask("usage")
+        runtime.toggleTask("usage")
+        let sawRun = await capture.waitForCallCount(1)
+        XCTAssertTrue(sawRun)
+        runtime.toggleTask("usage")
+        await runtime.cancelAllTaskRuns()
     }
 
     @MainActor
