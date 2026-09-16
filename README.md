@@ -58,7 +58,7 @@ TinkerBar started as a home for a few automations I use on my own Macs, so the b
 
 On first launch, TinkerBar creates these four task folders. They begin turned off, so nothing runs until you enable it from the menu. Built-in tasks use the same folder format as custom tasks.
 
-The optional `scriptKind` in `task.json` selects a bundled worker, such as `codex_update`, that TinkerBar refreshes on reload. Remove `scriptKind` when replacing a bundled worker with your own `run.sh`.
+The optional `scriptKind` in `task.json` selects a bundled worker, such as `codex_update`, that TinkerBar refreshes on reload. Remove `scriptKind` when replacing a bundled worker with your own `run.sh`. Existing configurations are left unchanged, including legacy tasks; add `scriptKind` explicitly to opt into bundled worker updates.
 
 ## Creating a task
 
@@ -93,7 +93,7 @@ For example, a folder-triggered task can use this configuration:
 Supported trigger kinds:
 
 - `directory` runs when new regular files appear in `directoryPath`.
-- `interval` runs every `intervalSeconds`.
+- `interval` runs every `intervalSeconds`, with a minimum of one second. Missing, nonpositive, or out-of-range intervals cannot be enabled.
 - `application` runs when the configured `applicationName` or `bundleIdentifier` opens or quits.
 
 TinkerBar calls each script with arguments for its trigger type:
@@ -103,6 +103,8 @@ Directory:   run.sh <directoryPath> <statusFile> <logFile>
 Interval:    run.sh <statusFile> <logFile>
 Application: run.sh <opened|closed|sync> <statusFile> <logFile>
 ```
+
+Workers run through `/bin/zsh`, so `run.sh` needs read permission but does not need execute permission. Custom worker permissions are left unchanged on reload.
 
 A nonzero exit status or a nonempty `last_error` value marks the run as failed. TinkerBar also records runner-level failures such as timeouts in `status.tsv`.
 

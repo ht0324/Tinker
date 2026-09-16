@@ -11,8 +11,6 @@ struct BuiltinTaskInstaller {
 
             if !fileManager.fileExists(atPath: paths.configFile.path) {
                 try writeConfiguration(configuration, to: paths.configFile)
-            } else {
-                try migrateConfigurationIfNeeded(defaultConfiguration: configuration, paths: paths)
             }
         }
     }
@@ -23,8 +21,6 @@ struct BuiltinTaskInstaller {
         } else if !fileManager.fileExists(atPath: paths.scriptFile.path) {
             throw AutomationError.invalidConfiguration("\(configuration.name) needs a run.sh script in \(paths.taskDirectory.path).")
         }
-
-        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.scriptFile.path)
 
         if configuration.scriptKind == "codex_usage_ledger" {
             guard let helperURL = Bundle.module.url(
@@ -41,39 +37,6 @@ struct BuiltinTaskInstaller {
         }
 
         try TaskStatusStore.createFileIfNeeded(for: paths, fileManager: fileManager)
-    }
-
-    private func migrateConfigurationIfNeeded(
-        defaultConfiguration: AutomationTaskConfiguration,
-        paths: AutomationTaskPaths
-    ) throws {
-        guard defaultConfiguration.id == "codex-usage-ledger" else { return }
-
-        guard
-            let data = try? Data(contentsOf: paths.configFile),
-            var configuration = try? JSONDecoder().decode(AutomationTaskConfiguration.self, from: data)
-        else {
-            // TaskCatalog will report a malformed folder without preventing
-            // the remaining built-in and custom tasks from loading.
-            return
-        }
-        guard configuration.id == defaultConfiguration.id else { return }
-
-        let oldDetailPrefix = "Track Codex spend"
-        let detailSuffix = configuration.detail.dropFirst(oldDetailPrefix.count)
-        guard configuration.detail.hasPrefix(oldDetailPrefix),
-              detailSuffix.isEmpty || detailSuffix.first?.isWhitespace == true else {
-            return
-        }
-
-        // Only the legacy configuration opts into this migration. An absent
-        // scriptKind otherwise means the user owns run.sh.
-        configuration.detail = "Track estimated Codex API-equivalent cost" + detailSuffix
-        if configuration.scriptKind == nil {
-            configuration.scriptKind = defaultConfiguration.scriptKind
-        }
-
-        try writeConfiguration(configuration, to: paths.configFile)
     }
 
     private func builtinScriptContents(for configuration: AutomationTaskConfiguration) throws -> String? {

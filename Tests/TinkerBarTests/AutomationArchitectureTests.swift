@@ -28,8 +28,15 @@ final class TaskCatalogTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
 
         let taskIDs = ["codex-update", "codex-usage-ledger", "heic-to-jpeg", "parsec-macmini-mirror"]
+        var originalConfigurations: [String: Data] = [:]
         for id in taskIDs {
-            try writeTask(id: id, name: id, triggerKind: .interval, appSupportDirectory: appSupportDirectory)
+            let paths = try writeTask(id: id, name: id, triggerKind: .interval, appSupportDirectory: appSupportDirectory)
+            if id == "codex-usage-ledger" {
+                var configuration = try loadConfiguration(from: paths.configFile)
+                configuration.detail = "Track Codex spend for my custom worker."
+                try JSONEncoder().encode(configuration).write(to: paths.configFile)
+            }
+            originalConfigurations[id] = try Data(contentsOf: paths.configFile)
         }
 
         let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory)
@@ -38,6 +45,7 @@ final class TaskCatalogTests: XCTestCase {
             XCTAssertEqual(Set(tasks.map(\.id)), Set(taskIDs))
             for task in tasks {
                 XCTAssertNil(task.configuration.scriptKind)
+                XCTAssertEqual(try Data(contentsOf: task.paths.configFile), originalConfigurations[task.id])
                 XCTAssertEqual(try String(contentsOf: task.paths.scriptFile, encoding: .utf8), "#!/bin/zsh\nexit 0\n")
                 XCTAssertFalse(FileManager.default.fileExists(
                     atPath: task.paths.taskDirectory.appendingPathComponent("codex-usage-app-server.mjs").path
@@ -76,6 +84,7 @@ final class TaskCatalogTests: XCTestCase {
             triggerKind: .interval,
             appSupportDirectory: appSupportDirectory
         )
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: taskDirectory.scriptFile.path)
 
         let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false)
         let tasks = try catalog.discoverTasks().tasks
@@ -84,6 +93,11 @@ final class TaskCatalogTests: XCTestCase {
         XCTAssertEqual(tasks.first?.configuration.name, "Sample Interval")
         XCTAssertTrue(FileManager.default.fileExists(atPath: taskDirectory.statusFile.path))
         XCTAssertTrue(tasks.first?.snapshot.filesInstalled == true)
+        let permissions = try FileManager.default.attributesOfItem(atPath: taskDirectory.scriptFile.path)[.posixPermissions] as? Int
+        XCTAssertEqual(permissions, 0o600)
+        guard case .success = TaskRunner().run(try XCTUnwrap(tasks.first)) else {
+            return XCTFail("Readable workers must run without execute permission")
+        }
     }
 
     func testSkipsInvalidTaskFolderWithoutFailingDiscovery() throws {
@@ -261,6 +275,47 @@ final class AutomationQuietHoursTests: XCTestCase {
 }
 
 final class AutomationRuntimeTests: XCTestCase {
+    @MainActor
+    func testInvalidIntervalsCannotEnableScheduling() async throws {
+        let appSupportDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
+        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let enablementStore = TaskEnablementStore(defaults: defaults)
+
+        for (index, interval) in ([nil, 0, -1, 1e100] as [Double?]).enumerated() {
+            let id = "invalid-\(index)"
+            try writeTask(
+                id: id, name: id, triggerKind: .interval, intervalSeconds: interval,
+                appSupportDirectory: appSupportDirectory
+            )
+            enablementStore.setEnabled(true, taskID: id)
+        }
+
+        let capture = CommandCapture()
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+            runner: TaskRunner(commandExecutor: capture.execute),
+            enablementStore: enablementStore,
+            quietHours: AutomationQuietHours(startHour: 0, endHour: 0),
+            loadStartupState: false
+        )
+
+        XCTAssertEqual(runtime.tasks.count, 4)
+        for task in runtime.tasks {
+            XCTAssertFalse(task.isEnabled)
+            XCTAssertFalse(enablementStore.isEnabled(task.id))
+            XCTAssertEqual(task.configuration.triggerDetail, "No valid interval configured")
+            runtime.toggleTask(task.id)
+            XCTAssertFalse(try XCTUnwrap(runtime.tasks.first(where: { $0.id == task.id })).isEnabled)
+            XCTAssertFalse(enablementStore.isEnabled(task.id))
+            XCTAssertTrue(runtime.message.contains("intervalSeconds"))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(capture.calls.isEmpty)
+    }
+
     @MainActor
     func testQuietHoursSuppressIntervalRuns() async throws {
         let appSupportDirectory = try makeTemporaryDirectory()

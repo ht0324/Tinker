@@ -452,8 +452,11 @@ final class AutomationRuntime: ObservableObject {
                 requestTaskRun(taskID, source: .directory)
             }
         case .interval:
+            guard let intervalSeconds = task.configuration.schedulingIntervalSeconds else {
+                removeLifecycleIfIdle(taskID)
+                throw AutomationError.invalidConfiguration("\(task.configuration.name) needs a valid positive intervalSeconds in task.json.")
+            }
             let schedulingToken = activateScheduling(lifecycle)
-            let intervalSeconds = intervalSeconds(for: task.configuration)
             let initialDelay = initialIntervalDelay(
                 for: task,
                 startMode: startMode,
@@ -630,10 +633,6 @@ final class AutomationRuntime: ObservableObject {
         let timer = Self.makeOneShotTimer(delay: delay, eventHandler: eventHandler)
         timer.resume()
         lifecycle.quietHoursTimer = timer
-    }
-
-    private func intervalSeconds(for configuration: AutomationTaskConfiguration) -> Double {
-        max(configuration.intervalSeconds ?? 0, 1)
     }
 
     private func initialIntervalDelay(

@@ -614,50 +614,6 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         )
     }
 
-    func testBuiltInUsageTaskMigratesOnlyTheLegacyDetailPrefix() throws {
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarUsageConfigMigrationTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let taskDirectory = root
-            .appendingPathComponent("tasks", isDirectory: true)
-            .appendingPathComponent("codex-usage-ledger", isDirectory: true)
-        try FileManager.default.createDirectory(at: taskDirectory, withIntermediateDirectories: true)
-
-        let configuration = AutomationTaskConfiguration(
-            id: "codex-usage-ledger",
-            name: "Codex Usage Ledger",
-            detail: "Track Codex spend for this Mac, Andrew, and Mac Mini.",
-            scriptKind: nil,
-            triggerKind: .interval,
-            directoryPath: nil,
-            intervalSeconds: 1_800,
-            openPath: "~/custom-ledger"
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(configuration).write(
-            to: taskDirectory.appendingPathComponent("task.json")
-        )
-
-        let usageTask = try XCTUnwrap(
-            TaskCatalog(appSupportDirectory: root)
-                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
-        )
-        XCTAssertEqual(
-            usageTask.configuration.detail,
-            "Track estimated Codex API-equivalent cost for this Mac, Andrew, and Mac Mini."
-        )
-        XCTAssertEqual(usageTask.configuration.scriptKind, "codex_usage_ledger")
-        XCTAssertEqual(usageTask.configuration.openPath, "~/custom-ledger")
-        XCTAssertTrue(
-            FileManager.default.fileExists(
-                atPath: usageTask.paths.taskDirectory
-                    .appendingPathComponent("codex-usage-app-server.mjs")
-                    .path
-            )
-        )
-    }
-
     func testCancellationStopsNestedUsageFetchProcessGroup() async throws {
         guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
             throw XCTSkip("Codex usage worker requires jq and perl")

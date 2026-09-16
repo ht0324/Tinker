@@ -50,6 +50,16 @@ struct AutomationTaskConfiguration: Codable, Sendable {
         applicationTargetDescription != nil
     }
 
+    var schedulingIntervalSeconds: Double? {
+        // Dispatch timers convert seconds to an Int number of nanoseconds.
+        guard let intervalSeconds,
+              intervalSeconds > 0,
+              intervalSeconds < Double(Int.max) / 1_000_000_000 else {
+            return nil
+        }
+        return max(intervalSeconds, 1)
+    }
+
     var triggerDescription: String {
         switch triggerKind {
         case .directory:
@@ -66,8 +76,8 @@ struct AutomationTaskConfiguration: Codable, Sendable {
         case .directory:
             return directoryPath ?? "No folder configured"
         case .interval:
-            guard let intervalSeconds, intervalSeconds > 0 else {
-                return "No interval configured"
+            guard let intervalSeconds = schedulingIntervalSeconds else {
+                return "No valid interval configured"
             }
             return "Every \(formatInterval(intervalSeconds))"
         case .application:
