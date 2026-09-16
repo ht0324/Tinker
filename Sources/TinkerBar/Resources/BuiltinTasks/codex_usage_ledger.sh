@@ -25,7 +25,7 @@ TIMEZONE="${TINKERBAR_CODEX_USAGE_TIMEZONE:-${TIMEZONE:-America/Los_Angeles}}"
 FETCH_TIMEOUT_SECONDS="${TINKERBAR_CODEX_USAGE_FETCH_TIMEOUT_SECONDS:-${FETCH_TIMEOUT_SECONDS:-300}}"
 DISCOVERY_FLOOR_DATE="${TINKERBAR_CODEX_USAGE_DISCOVERY_FLOOR_DATE:-${DISCOVERY_FLOOR_DATE:-2024-01-01}}"
 LEDGER_SCHEMA_VERSION=2
-CCUSAGE_VERSION="20.0.17"
+CCUSAGE_VERSION="20.0.20"
 CCUSAGE_PACKAGE="ccusage@$CCUSAGE_VERSION"
 # Keep historical estimates comparable. The active Codex client tier must not
 # retroactively change the price basis of previously recorded usage.
@@ -68,6 +68,20 @@ trap cleanup EXIT
 
 timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+format_estimate() {
+  local amount="$1"
+  local unpriced_count="$2"
+  if (( unpriced_count > 0 )); then
+    if (( amount == 0 )); then
+      print -r -- "Unpriced"
+    else
+      printf '≥$%.2f (unpriced usage)' "$amount"
+    fi
+  else
+    printf '$%.2f' "$amount"
+  fi
 }
 
 today_in_timezone() {
@@ -181,11 +195,11 @@ fetch_local_daily_range_json() {
 
   if [[ -n "$CCUSAGE_BIN_OVERRIDE" ]]; then
     run_with_timeout "$FETCH_TIMEOUT_SECONDS" \
-      "$CCUSAGE_BIN_OVERRIDE" codex daily --json --offline --speed "$CCUSAGE_SPEED" \
+      "$CCUSAGE_BIN_OVERRIDE" codex daily --json --no-offline --speed "$CCUSAGE_SPEED" \
       --timezone "$TIMEZONE" --since "$since_date" --until "$until_date"
   else
     run_with_timeout "$FETCH_TIMEOUT_SECONDS" \
-      "$NPX_BIN" --yes "$CCUSAGE_PACKAGE" codex daily --json --offline --speed "$CCUSAGE_SPEED" \
+      "$NPX_BIN" --yes "$CCUSAGE_PACKAGE" codex daily --json --no-offline --speed "$CCUSAGE_SPEED" \
       --timezone "$TIMEZONE" --since "$since_date" --until "$until_date"
   fi
 }
@@ -199,7 +213,7 @@ fetch_remote_daily_range_json() {
 emulate -LR zsh
 set -euo pipefail
 export PATH="\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\$PATH"
-npx --yes '$CCUSAGE_PACKAGE' codex daily --json --offline --speed '$CCUSAGE_SPEED' --timezone '$TIMEZONE' --since '$since_date' --until '$until_date'
+npx --yes '$CCUSAGE_PACKAGE' codex daily --json --no-offline --speed '$CCUSAGE_SPEED' --timezone '$TIMEZONE' --since '$since_date' --until '$until_date'
 EOF
 }
 
@@ -314,7 +328,7 @@ extract_row_for_date() {
       collector: {
         name: "ccusage",
         version: $collectorVersion,
-        pricingSource: "embedded_offline",
+        pricingSource: "online_with_embedded_fallback",
         speed: $pricingSpeed
       }
     }
@@ -353,7 +367,7 @@ ledger_requires_migration() {
         (.ledgerSchemaVersion // 0) == $schemaVersion and
         (.collector.version // "") == $version and
         (.collector.speed // "") == $speed and
-        (.collector.pricingSource // "") == "embedded_offline" and
+        (.collector.pricingSource // "") == "online_with_embedded_fallback" and
         (.timezone // "") == $timezone and
         (.costBasis // "") == "estimated_standard_api_equivalent"
       )
@@ -628,7 +642,7 @@ write_summary() {
       collector: {
         name: "ccusage",
         version: $collectorVersion,
-        pricingSource: "embedded_offline",
+        pricingSource: "online_with_embedded_fallback",
         speed: $pricingSpeed
       },
       generatedAt: $generatedAt,
@@ -880,20 +894,23 @@ ledger_rows=$(wc -l <"$LEDGER_FILE" | tr -d ' ')
 SUCCESS_COUNT="${ledger_rows:-0}"
 latest_recorded_date=$(jq -r '.latestRecordedDate // ""' "$SUMMARY_FILE")
 month_to_date_cost=$(jq -r '.monthToDate.totalCostUSD // 0' "$SUMMARY_FILE")
-month_to_date_cost_fmt=$(printf "%.2f" "$month_to_date_cost")
 yesterday_cost=$(jq -r '.yesterday.totalCostUSD // 0' "$SUMMARY_FILE")
-yesterday_cost_fmt=$(printf "%.2f" "$yesterday_cost")
 today_cost=$(jq -r '.today.totalCostUSD // 0' "$SUMMARY_FILE")
-today_cost_fmt=$(printf "%.2f" "$today_cost")
+month_unpriced=$(jq -s --arg since "$MONTH_START" '[.[] | select(.date >= $since and .totalTokens > 0 and .costUSD == 0)] | length' "$LEDGER_FILE")
+yesterday_unpriced=$(jq '[.yesterday.byHost[] | select(.totalTokens > 0 and .costUSD == 0)] | length' "$SUMMARY_FILE")
+today_unpriced=$(jq '[.today.byHost[] | select(.totalTokens > 0 and .costUSD == 0)] | length' "$SUMMARY_FILE")
+month_to_date_cost_fmt=$(format_estimate "$month_to_date_cost" "$month_unpriced")
+yesterday_cost_fmt=$(format_estimate "$yesterday_cost" "$yesterday_unpriced")
+today_cost_fmt=$(format_estimate "$today_cost" "$today_unpriced")
 
 if [[ -n "$LAST_ERROR" ]]; then
-  LAST_OUTPUT="Partial collection; ledger has $SUCCESS_COUNT rows through ${latest_recorded_date:-unknown}; known today estimate \$${today_cost_fmt}"
+  LAST_OUTPUT="Partial collection; ledger has $SUCCESS_COUNT rows through ${latest_recorded_date:-unknown}; known today estimate ${today_cost_fmt}"
 else
   LAST_SUCCESS_ISO=$(timestamp)
   if [[ "$ROWS_ADDED" -gt 0 ]]; then
-    LAST_OUTPUT="Added $ROWS_ADDED rows; yesterday estimate \$${yesterday_cost_fmt}; today \$${today_cost_fmt}; MTD estimate \$${month_to_date_cost_fmt} through $latest_recorded_date"
+    LAST_OUTPUT="Added $ROWS_ADDED rows; yesterday estimate ${yesterday_cost_fmt}; today ${today_cost_fmt}; MTD estimate ${month_to_date_cost_fmt} through $latest_recorded_date"
   else
-    LAST_OUTPUT="Already current through $latest_recorded_date; yesterday estimate \$${yesterday_cost_fmt}; today \$${today_cost_fmt}; MTD estimate \$${month_to_date_cost_fmt}"
+    LAST_OUTPUT="Already current through $latest_recorded_date; yesterday estimate ${yesterday_cost_fmt}; today ${today_cost_fmt}; MTD estimate ${month_to_date_cost_fmt}"
   fi
 fi
 

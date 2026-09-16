@@ -186,6 +186,36 @@ final class TaskRunnerReliabilityTests: XCTestCase {
 }
 
 final class CodexUsageLedgerIntegrationTests: XCTestCase {
+    func testOfflineV20LedgerIsRebuiltAndUnpricedUsageIsReported() throws {
+        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
+            throw XCTSkip("Codex usage worker requires jq and perl")
+        }
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarUnpricedLedgerTests")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let task = try XCTUnwrap(TaskCatalog(appSupportDirectory: root).discoverTasks().tasks.first {
+            $0.id == "codex-usage-ledger"
+        })
+        let collector = root.appendingPathComponent("fake-ccusage")
+        try fakeLocalUsageScript.replacingOccurrences(of: "1.25", with: "0").write(
+            to: collector, atomically: true, encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: collector.path)
+        let oldRow = """
+        {"ledgerSchemaVersion":2,"ledgerGeneration":"old","date":"\(utcDateString(daysFromToday: -1))","host":"local","timezone":"UTC","costUSD":0,"totalTokens":5,"costBasis":"estimated_standard_api_equivalent","collector":{"version":"20.0.20","speed":"standard","pricingSource":"embedded_offline"}}
+        """
+        try oldRow.write(to: task.paths.ledgerFile, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try runLedgerWorker(task, root: root, localCollector: collector), 0)
+        let ledger = try String(contentsOf: task.paths.ledgerFile, encoding: .utf8)
+        XCTAssertTrue(ledger.contains("online_with_embedded_fallback"))
+        XCTAssertFalse(ledger.contains("\"ledgerGeneration\":\"old\""))
+        let status = try String(contentsOf: task.paths.statusFile, encoding: .utf8)
+        XCTAssertTrue(status.contains("today Unpriced"), status)
+        XCTAssertTrue(status.contains("MTD estimate Unpriced"), status)
+        let snapshot = try XCTUnwrap(CodexUsageSnapshot.load(summaryFile: task.paths.summaryFile, ledgerFile: task.paths.ledgerFile))
+        XCTAssertEqual(snapshot.totalRow.today, "Unpriced")
+        XCTAssertEqual(snapshot.todayMenuBarBadgeText, "Unpriced")
+    }
+
     func testUnavailableRemoteDoesNotBlockHealthyTodayCollection() throws {
         guard
             executable(named: "jq") != nil,
@@ -245,7 +275,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         XCTAssertEqual(summary["ledgerSchemaVersion"] as? Int, 2)
         XCTAssertEqual(summary["costBasis"] as? String, "estimated_standard_api_equivalent")
         let collector = try XCTUnwrap(summary["collector"] as? [String: Any])
-        XCTAssertEqual(collector["version"] as? String, "20.0.17")
+        XCTAssertEqual(collector["version"] as? String, "20.0.20")
         XCTAssertEqual(collector["speed"] as? String, "standard")
         let log = try String(contentsOf: usageTask.paths.logFile, encoding: .utf8)
         XCTAssertEqual(Set(collection["historicalFailedHosts"] as? [String] ?? []), Set(["offline"]), log)
@@ -283,8 +313,8 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         XCTAssertEqual(accountUsage["available"] as? Bool, true)
 
         let invocations = try String(contentsOf: invocationLog, encoding: .utf8)
-        XCTAssertTrue(invocations.contains("codex daily --json --offline --speed standard"), invocations)
-        XCTAssertTrue(invocations.contains("npx --yes 'ccusage@20.0.17' codex daily"), invocations)
+        XCTAssertTrue(invocations.contains("codex daily --json --no-offline --speed standard"), invocations)
+        XCTAssertTrue(invocations.contains("npx --yes 'ccusage@20.0.20' codex daily"), invocations)
 
         let snapshot = try XCTUnwrap(
             CodexUsageSnapshot.load(
@@ -293,7 +323,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
             )
         )
         XCTAssertEqual(snapshot.partialDataText, "Partial data; unavailable: Offline")
-        XCTAssertTrue(snapshot.estimateNoticeText.contains("ccusage 20.0.17"))
+        XCTAssertTrue(snapshot.estimateNoticeText.contains("ccusage 20.0.20"))
         XCTAssertEqual(snapshot.modelSummaryText, "Recent models: gpt-5.6-sol, gpt-5.6-terra")
         XCTAssertNotNil(snapshot.officialUsageText)
         XCTAssertEqual(snapshot.totalRow.today, "≥$4")
@@ -339,7 +369,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
 
         let rebuiltLedger = try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8)
         XCTAssertTrue(rebuiltLedger.contains("\"ledgerSchemaVersion\":2"))
-        XCTAssertTrue(rebuiltLedger.contains("\"version\":\"20.0.17\""))
+        XCTAssertTrue(rebuiltLedger.contains("\"version\":\"20.0.20\""))
         XCTAssertFalse(rebuiltLedger.contains("pricingAdjustment"))
         XCTAssertFalse(rebuiltLedger.contains("9999"))
 
@@ -351,7 +381,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         let rebuiltGeneration = try XCTUnwrap(rebuiltSummary["ledgerGeneration"] as? String)
         XCTAssertEqual(
             (rebuiltSummary["collector"] as? [String: Any])?["version"] as? String,
-            "20.0.17"
+            "20.0.20"
         )
         let rebuiltFirstRow = try XCTUnwrap(
             JSONSerialization.jsonObject(
@@ -536,7 +566,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         let summaryFile = root.appendingPathComponent("latest-summary.json")
         let ledgerFile = root.appendingPathComponent("ledger.jsonl")
 
-        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"generation-a","rows":1,"timezone":"UTC","collector":{"version":"20.0.17","speed":"standard"},"models":{"observedRecent":["gpt-5.6-sol"],"catalogAvailable":true,"notInCurrentCatalog":[],"fallbackAttributed":[],"possiblyUnpricedRows":[]},"official":{"probeWarning":42,"accountUsage":{"available":true,"dailyUsageBuckets":[{"startDate":42,"tokens":"bad"}]}},"latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":1.25,"byHost":[{"host":"local","totalCostUSD":1.25}]},"latestByHost":[{"host":"local","costUSD":1.25}],"yesterday":{"totalCostUSD":1.25,"byHost":[{"host":"local","costUSD":1.25}]},"today":{"totalCostUSD":0,"byHost":[],"unavailableHosts":[]}}"#.write(
+        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"generation-a","rows":1,"timezone":"UTC","collector":{"version":"20.0.20","speed":"standard"},"models":{"observedRecent":["gpt-5.6-sol"],"catalogAvailable":true,"notInCurrentCatalog":[],"fallbackAttributed":[],"possiblyUnpricedRows":[]},"official":{"probeWarning":42,"accountUsage":{"available":true,"dailyUsageBuckets":[{"startDate":42,"tokens":"bad"}]}},"latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":1.25,"byHost":[{"host":"local","totalCostUSD":1.25}]},"latestByHost":[{"host":"local","costUSD":1.25}],"yesterday":{"totalCostUSD":1.25,"byHost":[{"host":"local","costUSD":1.25}]},"today":{"totalCostUSD":0,"byHost":[],"unavailableHosts":[]}}"#.write(
             to: summaryFile,
             atomically: true,
             encoding: .utf8
@@ -562,7 +592,7 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         let summaryFile = root.appendingPathComponent("latest-summary.json")
         let ledgerFile = root.appendingPathComponent("ledger.jsonl")
 
-        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"summary-generation","rows":1,"timezone":"UTC","collector":{"version":"20.0.17","speed":"standard"},"latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":9999,"byHost":[{"host":"local","totalCostUSD":9999}]},"latestByHost":[{"host":"local","costUSD":9999}],"today":{"totalCostUSD":9999,"byHost":[{"host":"local","costUSD":9999}],"unavailableHosts":[]}}"#.write(
+        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"summary-generation","rows":1,"timezone":"UTC","collector":{"version":"20.0.20","speed":"standard"},"latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":9999,"byHost":[{"host":"local","totalCostUSD":9999}]},"latestByHost":[{"host":"local","costUSD":9999}],"today":{"totalCostUSD":9999,"byHost":[{"host":"local","costUSD":9999}],"unavailableHosts":[]}}"#.write(
             to: summaryFile,
             atomically: true,
             encoding: .utf8

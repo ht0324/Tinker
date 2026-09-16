@@ -56,6 +56,25 @@ struct CodexUsageSnapshot: Sendable {
         let hosts = orderedHosts(summary: summary, ledgerHosts: aggregation.hosts)
         let historicalUnavailableHosts = Set(summary.collection?.historicalFailedHosts ?? [])
         let todayUnavailableHosts = Set(summary.today?.unavailableHosts ?? [])
+        var unpricedUsage = aggregation.unpricedUsage
+        for row in summary.models?.possiblyUnpricedRows ?? [] {
+            if let host = row.host, let date = row.date {
+                unpricedUsage.add(host: host, date: date)
+            }
+        }
+        let todayDate = summary.today?.date ?? dateString(inTimezone: summary.timezone)
+        let yesterdayDate = summary.yesterday?.date
+            ?? yesterdayDateString(inTimezone: summary.timezone)
+            ?? summary.latestRecordedDate
+        for row in summary.today?.byHost ?? [] where row.costUSD == 0 && (row.totalTokens ?? 0) > 0 {
+            unpricedUsage.add(host: row.host, date: todayDate)
+        }
+        let monthStart = summary.monthToDate.since ?? String(todayDate.prefix(7)) + "-01"
+        let allTimeUnpricedHosts = aggregation.unpricedUsage.hosts()
+        let monthUnpricedHosts = aggregation.unpricedUsage.hosts(since: monthStart)
+        let yesterdayUnpricedHosts = unpricedUsage.hosts(on: yesterdayDate)
+        let todayUnpricedHosts = unpricedUsage.hosts(on: todayDate)
+        let recentUnpricedHosts = aggregation.unpricedUsage.hosts(since: recentDates.first)
 
         let recentDailyTotals = recentDates.map { aggregation.dailyTotals[$0, default: 0] }
 
@@ -85,7 +104,8 @@ struct CodexUsageSnapshot: Sendable {
             recordedPeriodText: "Recorded \(earliestRecordedDate) to \(summary.latestRecordedDate)",
             estimateNoticeText: estimateNotice(summary: summary),
             partialDataText: partialDataMessage(
-                unavailableHosts: historicalUnavailableHosts.union(todayUnavailableHosts)
+                unavailableHosts: historicalUnavailableHosts.union(todayUnavailableHosts),
+                unpricedHosts: unpricedUsage.hosts()
             ),
             modelSummaryText: modelSummary(summary: summary),
             dataQualityText: dataQualityMessage(summary: summary),
@@ -95,11 +115,11 @@ struct CodexUsageSnapshot: Sendable {
             totalRow: Row(
                 id: "total",
                 label: "Total",
-                allTime: lowerBoundCurrency(aggregation.allTimeTotalUSD, hasGap: hasHistoricalGaps),
-                monthToDate: lowerBoundCurrency(summary.monthToDate.totalCostUSD, hasGap: hasHistoricalGaps),
-                yesterday: lowerBoundCurrency(yesterday.totalUSD, hasGap: hasHistoricalGaps),
-                today: lowerBoundCurrency(todayTotalUSD, hasGap: hasTodayGaps),
-                sparkline: sparkline(for: recentDailyTotals)
+                allTime: estimatedCurrency(aggregation.allTimeTotalUSD, hasGap: hasHistoricalGaps, unpriced: !allTimeUnpricedHosts.isEmpty),
+                monthToDate: estimatedCurrency(summary.monthToDate.totalCostUSD, hasGap: hasHistoricalGaps, unpriced: !monthUnpricedHosts.isEmpty),
+                yesterday: estimatedCurrency(yesterday.totalUSD, hasGap: hasHistoricalGaps, unpriced: !yesterdayUnpricedHosts.isEmpty),
+                today: estimatedCurrency(todayTotalUSD, hasGap: hasTodayGaps, unpriced: !todayUnpricedHosts.isEmpty),
+                sparkline: recentUnpricedHosts.isEmpty ? sparkline(for: recentDailyTotals) : "—"
             ),
             hostRows: makeHostRows(
                 allTime: allTimeByHost,
@@ -108,12 +128,15 @@ struct CodexUsageSnapshot: Sendable {
                 today: todayByHost,
                 recentDailyByHost: recentDailyByHost,
                 historicalUnavailableHosts: historicalUnavailableHosts,
-                todayUnavailableHosts: todayUnavailableHosts
+                todayUnavailableHosts: todayUnavailableHosts,
+                allTimeUnpricedHosts: allTimeUnpricedHosts,
+                monthUnpricedHosts: monthUnpricedHosts,
+                yesterdayUnpricedHosts: yesterdayUnpricedHosts,
+                todayUnpricedHosts: todayUnpricedHosts,
+                recentUnpricedHosts: recentUnpricedHosts
             ),
-            menuBarBadgeText: partialPrefix(hasGaps: hasHistoricalGaps)
-                + compactCurrency(summary.monthToDate.totalCostUSD),
-            todayMenuBarBadgeText: partialPrefix(hasGaps: hasTodayGaps)
-                + trailingDollarCompactCurrency(todayTotalUSD)
+            menuBarBadgeText: estimateBadge(summary.monthToDate.totalCostUSD, hasGap: hasHistoricalGaps, unpriced: !monthUnpricedHosts.isEmpty, today: false),
+            todayMenuBarBadgeText: estimateBadge(todayTotalUSD, hasGap: hasTodayGaps, unpriced: !todayUnpricedHosts.isEmpty, today: true)
         )
     }
 
@@ -218,6 +241,14 @@ struct CodexUsageSnapshot: Sendable {
         return formatter.string(from: yesterday)
     }
 
+    private static func dateString(inTimezone identifier: String) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = TimeZone(identifier: identifier) ?? .current
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
+    }
+
     private static func makeHostRows(
         allTime: [HostCost],
         monthToDate: [HostCost],
@@ -225,7 +256,12 @@ struct CodexUsageSnapshot: Sendable {
         today: [HostCost],
         recentDailyByHost: [String: [Double]],
         historicalUnavailableHosts: Set<String>,
-        todayUnavailableHosts: Set<String>
+        todayUnavailableHosts: Set<String>,
+        allTimeUnpricedHosts: Set<String>,
+        monthUnpricedHosts: Set<String>,
+        yesterdayUnpricedHosts: Set<String>,
+        todayUnpricedHosts: Set<String>,
+        recentUnpricedHosts: Set<String>
     ) -> [Row] {
         let monthToDateCosts = costsByHost(monthToDate)
         let yesterdayCosts = costsByHost(yesterday)
@@ -238,18 +274,20 @@ struct CodexUsageSnapshot: Sendable {
                 return Row(
                     id: host.host,
                     label: hostDisplayName(host.host),
-                    allTime: lowerBoundCurrency(host.costUSD, hasGap: hasHistoricalGap),
-                    monthToDate: lowerBoundCurrency(
+                    allTime: estimatedCurrency(host.costUSD, hasGap: hasHistoricalGap, unpriced: allTimeUnpricedHosts.contains(host.host)),
+                    monthToDate: estimatedCurrency(
                         monthToDateCosts[host.host, default: 0],
-                        hasGap: hasHistoricalGap
+                        hasGap: hasHistoricalGap,
+                        unpriced: monthUnpricedHosts.contains(host.host)
                     ),
                     yesterday: hasHistoricalGap
                         ? "—"
-                        : wholeCurrency(yesterdayCosts[host.host, default: 0]),
+                        : estimatedCurrency(yesterdayCosts[host.host, default: 0], unpriced: yesterdayUnpricedHosts.contains(host.host)),
                     today: todayUnavailableHosts.contains(host.host)
                         ? "—"
-                        : wholeCurrency(todayCosts[host.host, default: 0]),
-                    sparkline: sparkline(for: recentDailyByHost[host.host, default: []])
+                        : estimatedCurrency(todayCosts[host.host, default: 0], unpriced: todayUnpricedHosts.contains(host.host)),
+                    sparkline: recentUnpricedHosts.contains(host.host)
+                        ? "—" : sparkline(for: recentDailyByHost[host.host, default: []])
                 )
             }
     }
@@ -258,14 +296,17 @@ struct CodexUsageSnapshot: Sendable {
         Dictionary(costs.map { ($0.host, $0.costUSD) }, uniquingKeysWith: { _, latest in latest })
     }
 
-    private static func partialDataMessage(unavailableHosts: Set<String>) -> String? {
-        guard !unavailableHosts.isEmpty else { return nil }
-
-        let description = unavailableHosts
-            .map(hostDisplayName)
-            .sorted()
-            .joined(separator: ", ")
-        return "Partial data; unavailable: \(description)"
+    private static func partialDataMessage(unavailableHosts: Set<String>, unpricedHosts: Set<String>) -> String? {
+        var messages: [String] = []
+        if !unavailableHosts.isEmpty {
+            let description = unavailableHosts.map(hostDisplayName).sorted().joined(separator: ", ")
+            messages.append("Partial data; unavailable: \(description)")
+        }
+        if !unpricedHosts.isEmpty {
+            let description = unpricedHosts.map(hostDisplayName).sorted().joined(separator: ", ")
+            messages.append("Unpriced usage: \(description); marked totals are incomplete")
+        }
+        return messages.isEmpty ? nil : messages.joined(separator: " • ")
     }
 
     private static func estimateNotice(summary: SummaryDocument) -> String {
@@ -354,6 +395,17 @@ struct CodexUsageSnapshot: Sendable {
         partialPrefix(hasGaps: hasGap) + wholeCurrency(amount)
     }
 
+    private static func estimatedCurrency(_ amount: Double, hasGap: Bool = false, unpriced: Bool) -> String {
+        if unpriced && amount == 0 { return "Unpriced" }
+        return lowerBoundCurrency(amount, hasGap: hasGap || unpriced)
+    }
+
+    private static func estimateBadge(_ amount: Double, hasGap: Bool, unpriced: Bool, today: Bool) -> String {
+        if unpriced && amount == 0 { return "Unpriced" }
+        return partialPrefix(hasGaps: hasGap || unpriced)
+            + (today ? trailingDollarCompactCurrency(amount) : compactCurrency(amount))
+    }
+
     private static func wholeCurrency(_ amount: Double) -> String {
         wholeCurrencyFormatter.string(from: NSNumber(value: amount)) ?? "$\(Int(amount.rounded()))"
     }
@@ -433,6 +485,9 @@ struct CodexUsageSnapshot: Sendable {
             aggregation.hosts.insert(row.host)
             aggregation.dailyTotals[row.date, default: 0] += row.costUSD
             aggregation.dailyTotalsByHost[row.host, default: [:]][row.date, default: 0] += row.costUSD
+            if row.costUSD == 0 && (row.totalTokens ?? 0) > 0 {
+                aggregation.unpricedUsage.add(host: row.host, date: row.date)
+            }
 
             if let earliestRecordedDate = aggregation.earliestRecordedDate {
                 aggregation.earliestRecordedDate = min(earliestRecordedDate, row.date)
@@ -491,6 +546,22 @@ private struct LedgerAggregation {
     var dailyTotals: [String: Double] = [:]
     var dailyTotalsByHost: [String: [String: Double]] = [:]
     var hostTotals: [String: HostTotals] = [:]
+    var unpricedUsage = UnpricedUsage()
+}
+
+private struct UnpricedUsage {
+    private var datesByHost: [String: Set<String>] = [:]
+
+    mutating func add(host: String, date: String) {
+        datesByHost[host, default: []].insert(date)
+    }
+
+    func hosts(since: String? = nil, on date: String? = nil) -> Set<String> {
+        Set(datesByHost.compactMap { host, dates in
+            dates.contains(where: { (since == nil || $0 >= since!) && (date == nil || $0 == date!) })
+                ? host : nil
+        })
+    }
 }
 
 private struct HostTotals {
@@ -509,7 +580,10 @@ private struct SummaryDocument: Decodable {
     }
 
     struct ModelDiagnostics: Decodable {
-        struct PossiblyUnpricedRow: Decodable {}
+        struct PossiblyUnpricedRow: Decodable {
+            let date: String?
+            let host: String?
+        }
 
         let observedRecent: [String]?
         let catalogAvailable: Bool?
@@ -594,14 +668,17 @@ private struct SummaryDocument: Decodable {
 
         let totalCostUSD: Double
         let byHost: [HostEntry]
+        let since: String?
     }
 
     struct LatestHostEntry: Decodable {
         let host: String
         let costUSD: Double
+        let totalTokens: Double?
     }
 
     struct DaySummary: Decodable {
+        let date: String?
         let totalCostUSD: Double
         let byHost: [LatestHostEntry]
         let unavailableHosts: [String]?
@@ -627,6 +704,7 @@ private struct LedgerRow: Decodable {
     let date: String
     let host: String
     let costUSD: Double
+    let totalTokens: Double?
 }
 
 private final class CodexUsageSnapshotCache: @unchecked Sendable {
