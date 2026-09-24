@@ -12,89 +12,36 @@ last_error\tstale worker failure
 """
 
 final class TaskRunnerReliabilityTests: XCTestCase {
-    func testExitZeroWithWorkerErrorReturnsFailure() throws {
-        let fixture = try makeTaskFixture(
-            status: """
-            last_run_iso\t2026-07-10T00:00:00Z
-            last_success_iso\t
-            success_count\t0
-            last_output\t
-            last_error\tworker reported failure
-            """
-        )
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
+    func testRunnerFailuresPublishAuthoritativeDiagnostics() throws {
+        let cases: [(script: String?, previousError: String, diagnostic: String)] = [
+            ("exit 0", "worker reported failure", "worker reported failure"),
+            ("exit 7", "", "Reliability Task exited with status 7. Open the task log for details."),
+            ("print -u2 -- 'fresh process failure'; exit 7", "stale worker failure", "fresh process failure"),
+            (nil, "", "needs a run.sh script"),
+        ]
+        for scenario in cases {
+            let fixture = try makeTaskFixture(
+                script: scenario.script ?? "",
+                status: "last_error\t\(scenario.previousError)\ncustom_key\tkeep-me\n"
+            )
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            if scenario.script == nil {
+                try FileManager.default.removeItem(at: fixture.task.paths.scriptFile)
+            }
 
-        let runner = TaskRunner(commandExecutor: { _, _, _ in
-            CommandResult(exitCode: 0, stdout: "", stderr: "")
-        })
-
-        guard case .failure(let message, let snapshot) = runner.run(fixture.task) else {
-            return XCTFail("Expected worker status error to make the run fail")
+            guard case .failure(let message, let snapshot) = TaskRunner().run(fixture.task) else {
+                XCTFail("Expected failure: \(scenario.diagnostic)")
+                continue
+            }
+            let expected = scenario.script == nil
+                ? "Reliability Task needs a run.sh script in \(fixture.task.paths.taskDirectory.path)."
+                : scenario.diagnostic
+            XCTAssertEqual(message, expected)
+            XCTAssertEqual(snapshot.lastError, message)
+            let persisted = try String(contentsOf: fixture.task.paths.statusFile, encoding: .utf8)
+            XCTAssertTrue(persisted.contains("last_error\t\(message)"), persisted)
+            XCTAssertTrue(persisted.contains("custom_key\tkeep-me"), persisted)
         }
-
-        XCTAssertEqual(message, "worker reported failure")
-        XCTAssertEqual(snapshot.lastError, "worker reported failure")
-    }
-
-    func testNonzeroExitPersistsFallbackDiagnostic() throws {
-        let fixture = try makeTaskFixture(
-            status: """
-            last_run_iso\t
-            last_success_iso\t
-            success_count\t0
-            last_output\t
-            last_error\t
-            custom_key\tkeep-me
-            """
-        )
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-        let runner = TaskRunner(commandExecutor: { _, _, _ in
-            CommandResult(exitCode: 7, stdout: "", stderr: "")
-        })
-
-        guard case .failure(let message, let snapshot) = runner.run(fixture.task) else {
-            return XCTFail("Expected nonzero exit to fail")
-        }
-
-        XCTAssertTrue(message.contains("status 7"))
-        XCTAssertEqual(snapshot.lastError, message)
-
-        let persistedStatus = try String(contentsOf: fixture.task.paths.statusFile, encoding: .utf8)
-        XCTAssertTrue(persistedStatus.contains("custom_key\tkeep-me"))
-        XCTAssertTrue(persistedStatus.contains("last_error\t\(message)"))
-    }
-
-    func testNonzeroExitReplacesStaleErrorWithCurrentDiagnostic() throws {
-        let fixture = try makeTaskFixture(
-            status: staleWorkerStatus
-        )
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-        let runner = TaskRunner(commandExecutor: { _, _, _ in
-            CommandResult(exitCode: 7, stdout: "", stderr: "fresh process failure")
-        })
-
-        guard case .failure(let message, let snapshot) = runner.run(fixture.task) else {
-            return XCTFail("Expected nonzero exit to fail")
-        }
-
-        XCTAssertEqual(message, "fresh process failure")
-        XCTAssertEqual(snapshot.lastError, "fresh process failure")
-    }
-
-    func testRunnerConfigurationFailurePersistsDiagnostic() throws {
-        let fixture = try makeTaskFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        try FileManager.default.removeItem(at: fixture.task.paths.scriptFile)
-
-        let runner = TaskRunner()
-        guard case .failure(let message, let snapshot) = runner.run(fixture.task) else {
-            return XCTFail("Expected missing worker script to fail")
-        }
-
-        XCTAssertTrue(message.contains("needs a run.sh script"))
-        XCTAssertEqual(snapshot.lastError, message)
     }
 
     func testTimeoutStopsWorkerProcessGroupAndPersistsError() throws {
@@ -127,39 +74,6 @@ final class TaskRunnerReliabilityTests: XCTestCase {
         )
     }
 
-    func testCancellationStopsWorkerProcessGroup() async throws {
-        let fixture = try makeTaskFixture(
-            script: sleepingWorkerScript,
-            status: staleWorkerStatus
-        )
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-        let runner = TaskRunner(executionTimeout: 10)
-        let execution = Task.detached {
-            runner.run(fixture.task)
-        }
-
-        let childFile = fixture.task.paths.taskDirectory.appendingPathComponent("child.pid")
-        let workerStarted = await waitUntil(timeout: 2) {
-            FileManager.default.fileExists(atPath: childFile.path)
-        }
-        XCTAssertTrue(workerStarted)
-
-        execution.cancel()
-        let outcome = await execution.value
-
-        guard case .cancelled(let snapshot) = outcome else {
-            return XCTFail("Expected worker to be cancelled")
-        }
-
-        XCTAssertTrue(snapshot.lastError.contains("stopped before completion"))
-        let childPID = try readChildPID(from: fixture.task.paths.taskDirectory)
-        XCTAssertTrue(
-            waitForProcessToExit(childPID, timeout: 2),
-            "Child remained after cancellation: \(processDescription(childPID))"
-        )
-    }
-
     func testCommandOutputIsDrainedAndBounded() {
         let result = CommandRunner.run(
             "/bin/zsh",
@@ -173,47 +87,67 @@ final class TaskRunnerReliabilityTests: XCTestCase {
         XCTAssertLessThanOrEqual(result.stdout.utf8.count, 128)
         XCTAssertTrue(result.stdout.hasSuffix("TAIL\n"))
     }
-
-    private var sleepingWorkerScript: String {
-        """
-        #!/bin/zsh
-        /bin/sleep 10 &
-        child_pid=$!
-        print -r -- "$child_pid" > "${0:h}/child.pid"
-        wait "$child_pid"
-        """
-    }
 }
 
 final class CodexUsageLedgerIntegrationTests: XCTestCase {
-    func testOfflineV20LedgerIsRebuiltAndUnpricedUsageIsReported() throws {
-        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
-            throw XCTSkip("Codex usage worker requires jq and perl")
+    func testLedgerMigrationsRebuildInvalidEstimatesAndKeepBackup() throws {
+        for migration in ["schema", "offline"] {
+            let fixture = try makeLedgerFixture(
+                collectorScript: migration == "offline"
+                    ? fakeLocalUsageScript.replacingOccurrences(of: "1.25", with: "0")
+                    : fakeLocalUsageScript
+            )
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let collector: [String: Any] = [
+                "version": "20.0.20", "speed": "standard",
+                "pricingSource": migration == "offline" ? "embedded_offline" : "online_with_embedded_fallback",
+            ]
+            var old: [String: Any] = [
+                "ledgerSchemaVersion": 2, "ledgerGeneration": "old", "date": utcDateString(daysFromToday: -1),
+                "host": "local", "timezone": "UTC", "costUSD": 9999, "totalTokens": 5,
+                "costBasis": "estimated_standard_api_equivalent", "collector": collector,
+            ]
+            if migration == "schema" {
+                old.removeValue(forKey: "ledgerSchemaVersion")
+                old["pricingAdjustment"] = ["mode": "legacy"]
+            }
+            let oldRow = String(decoding: try JSONSerialization.data(withJSONObject: old), as: UTF8.self)
+            try oldRow.write(to: fixture.task.paths.ledgerFile, atomically: true, encoding: .utf8)
+
+            XCTAssertEqual(try runLedgerWorker(fixture.task, root: fixture.root, localCollector: fixture.collector), 0, migration)
+            let rebuilt = try String(contentsOf: fixture.task.paths.ledgerFile, encoding: .utf8)
+            let row = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(try XCTUnwrap(rebuilt.split(separator: "\n").first).utf8)
+            ) as? [String: Any])
+            let summary = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: fixture.task.paths.summaryFile)
+            ) as? [String: Any])
+            let generation = try XCTUnwrap(summary["ledgerGeneration"] as? String)
+            XCTAssertNotEqual(generation, "old", migration)
+            XCTAssertEqual(row["ledgerGeneration"] as? String, generation, migration)
+            XCTAssertEqual(row["ledgerSchemaVersion"] as? Int, 2, migration)
+            XCTAssertEqual(summary["ledgerSchemaVersion"] as? Int, 2, migration)
+            XCTAssertEqual((row["collector"] as? [String: Any])?["version"] as? String, "20.0.20", migration)
+            XCTAssertEqual((summary["collector"] as? [String: Any])?["version"] as? String, "20.0.20", migration)
+            XCTAssertEqual((row["collector"] as? [String: Any])?["pricingSource"] as? String, "online_with_embedded_fallback", migration)
+            XCTAssertNil(row["pricingAdjustment"], migration)
+            XCTAssertFalse(rebuilt.contains("9999"), migration)
+            let backups = try FileManager.default.contentsOfDirectory(atPath: fixture.task.paths.taskDirectory.path)
+                .filter { $0.hasPrefix("ledger.jsonl.rebuild-") && $0.hasSuffix(".bak") }
+            XCTAssertEqual(backups.count, 1, migration)
+            let backup = fixture.task.paths.taskDirectory.appendingPathComponent(try XCTUnwrap(backups.first))
+            XCTAssertEqual(try String(contentsOf: backup, encoding: .utf8), oldRow, migration)
+            if migration == "offline" {
+                let status = try String(contentsOf: fixture.task.paths.statusFile, encoding: .utf8)
+                XCTAssertTrue(status.contains("today Unpriced"), status)
+                XCTAssertTrue(status.contains("MTD estimate Unpriced"), status)
+                let snapshot = try XCTUnwrap(CodexUsageSnapshot.load(
+                    summaryFile: fixture.task.paths.summaryFile, ledgerFile: fixture.task.paths.ledgerFile
+                ))
+                XCTAssertEqual(snapshot.totalRow.today, "Unpriced")
+                XCTAssertEqual(snapshot.todayMenuBarBadgeText, "Unpriced")
+            }
         }
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarUnpricedLedgerTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-        let task = try XCTUnwrap(TaskCatalog(appSupportDirectory: root).discoverTasks().tasks.first {
-            $0.id == "codex-usage-ledger"
-        })
-        let collector = root.appendingPathComponent("fake-ccusage")
-        try fakeLocalUsageScript.replacingOccurrences(of: "1.25", with: "0").write(
-            to: collector, atomically: true, encoding: .utf8
-        )
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: collector.path)
-        let oldRow = """
-        {"ledgerSchemaVersion":2,"ledgerGeneration":"old","date":"\(utcDateString(daysFromToday: -1))","host":"local","timezone":"UTC","costUSD":0,"totalTokens":5,"costBasis":"estimated_standard_api_equivalent","collector":{"version":"20.0.20","speed":"standard","pricingSource":"embedded_offline"}}
-        """
-        try oldRow.write(to: task.paths.ledgerFile, atomically: true, encoding: .utf8)
-        XCTAssertEqual(try runLedgerWorker(task, root: root, localCollector: collector), 0)
-        let ledger = try String(contentsOf: task.paths.ledgerFile, encoding: .utf8)
-        XCTAssertTrue(ledger.contains("online_with_embedded_fallback"))
-        XCTAssertFalse(ledger.contains("\"ledgerGeneration\":\"old\""))
-        let status = try String(contentsOf: task.paths.statusFile, encoding: .utf8)
-        XCTAssertTrue(status.contains("today Unpriced"), status)
-        XCTAssertTrue(status.contains("MTD estimate Unpriced"), status)
-        let snapshot = try XCTUnwrap(CodexUsageSnapshot.load(summaryFile: task.paths.summaryFile, ledgerFile: task.paths.ledgerFile))
-        XCTAssertEqual(snapshot.totalRow.today, "Unpriced")
-        XCTAssertEqual(snapshot.todayMenuBarBadgeText, "Unpriced")
     }
 
     func testUnavailableRemoteDoesNotBlockHealthyTodayCollection() throws {
@@ -338,226 +272,72 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         XCTAssertTrue(status.contains("last_output\tPartial collection"))
     }
 
-    func testLegacyLedgerMigrationCommitsAtomicallyAndKeepsBackup() throws {
-        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
-            throw XCTSkip("Codex usage worker requires jq and perl")
+    func testIncompleteRebuildsRetainOriginalHistory() throws {
+        for (failure, diagnostic) in [
+            ("offline", "Failed to collect offline usage"),
+            ("truncated", "Incomplete usage coverage from local"),
+            ("empty", "Empty usage response from local"),
+        ] {
+            let fixture = try makeLedgerFixture(
+                collectorScript: failure == "empty"
+                    ? "#!/bin/zsh\nprint -r -- '{\"daily\":[],\"totals\":{}}'\n"
+                    : fakeLocalUsageScript
+            )
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let remoteCollector = fixture.root.appendingPathComponent("fake-ssh")
+            try fakeRemoteUsageScript.write(to: remoteCollector, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: remoteCollector.path)
+            let oldDate = failure == "offline" ? utcDateString(daysFromToday: -1) : "2026-01-01"
+            let legacyLedger = "{\"date\":\"\(oldDate)\",\"host\":\"local\",\"costUSD\":9999,\"totalTokens\":1}\n"
+            try legacyLedger.write(to: fixture.task.paths.ledgerFile, atomically: true, encoding: .utf8)
+
+            XCTAssertEqual(try runLedgerWorker(
+                fixture.task, root: fixture.root, localCollector: fixture.collector,
+                remoteCollector: remoteCollector, remoteHosts: failure == "offline" ? "offline" : ""
+            ), 1, failure)
+            XCTAssertEqual(try String(contentsOf: fixture.task.paths.ledgerFile, encoding: .utf8), legacyLedger, failure)
+            let backups = try FileManager.default.contentsOfDirectory(atPath: fixture.task.paths.taskDirectory.path)
+                .filter { $0.hasPrefix("ledger.jsonl.rebuild-") && $0.hasSuffix(".bak") }
+            XCTAssertTrue(backups.isEmpty, failure)
+            let log = try String(contentsOf: fixture.task.paths.logFile, encoding: .utf8)
+            XCTAssertTrue(log.contains(diagnostic), log)
+            let status = try String(contentsOf: fixture.task.paths.statusFile, encoding: .utf8)
+            XCTAssertTrue(status.contains("Ledger rebuild not committed"), status)
+            XCTAssertTrue(status.contains("Previous ledger retained"), status)
         }
-
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerMigrationTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let usageTask = try XCTUnwrap(
-            TaskCatalog(appSupportDirectory: root)
-                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
-        )
-        let fakeLocal = root.appendingPathComponent("fake-ccusage")
-        try fakeLocalUsageScript.write(to: fakeLocal, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLocal.path)
-
-        let legacyLedger = """
-        {"date":"\(utcDateString(daysFromToday: -1))","host":"local","costUSD":9999,"totalTokens":1,"pricingAdjustment":{"mode":"legacy"}}
-
-        """
-        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
-
-        let exitCode = try runLedgerWorker(
-            usageTask,
-            root: root,
-            localCollector: fakeLocal
-        )
-        XCTAssertEqual(exitCode, 0)
-
-        let rebuiltLedger = try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8)
-        XCTAssertTrue(rebuiltLedger.contains("\"ledgerSchemaVersion\":2"))
-        XCTAssertTrue(rebuiltLedger.contains("\"version\":\"20.0.20\""))
-        XCTAssertFalse(rebuiltLedger.contains("pricingAdjustment"))
-        XCTAssertFalse(rebuiltLedger.contains("9999"))
-
-        let rebuiltSummaryData = try Data(contentsOf: usageTask.paths.summaryFile)
-        let rebuiltSummary = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: rebuiltSummaryData) as? [String: Any]
-        )
-        XCTAssertEqual(rebuiltSummary["ledgerSchemaVersion"] as? Int, 2)
-        let rebuiltGeneration = try XCTUnwrap(rebuiltSummary["ledgerGeneration"] as? String)
-        XCTAssertEqual(
-            (rebuiltSummary["collector"] as? [String: Any])?["version"] as? String,
-            "20.0.20"
-        )
-        let rebuiltFirstRow = try XCTUnwrap(
-            JSONSerialization.jsonObject(
-                with: Data(try XCTUnwrap(rebuiltLedger.split(separator: "\n").first).utf8)
-            ) as? [String: Any]
-        )
-        XCTAssertEqual(rebuiltFirstRow["ledgerGeneration"] as? String, rebuiltGeneration)
-
-        let backups = try FileManager.default.contentsOfDirectory(
-            at: usageTask.paths.taskDirectory,
-            includingPropertiesForKeys: nil
-        ).filter {
-            $0.lastPathComponent.hasPrefix("ledger.jsonl.rebuild-") &&
-                $0.pathExtension == "bak"
-        }
-        XCTAssertEqual(backups.count, 1)
-        XCTAssertEqual(try String(contentsOf: XCTUnwrap(backups.first), encoding: .utf8), legacyLedger)
     }
 
-    func testFailedLegacyLedgerMigrationRetainsOriginalWithoutBackupSwap() throws {
-        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
-            throw XCTSkip("Codex usage worker requires jq and perl")
+    func testUntrustedSnapshotsSuppressDollarTotals() throws {
+        let cases: [(schema: Int?, generation: String, message: String)] = [
+            (nil, "generation-a", "Codex ledger rebuild required"),
+            (2, "generation-b", "Codex ledger update incomplete; run the usage task again."),
+        ]
+        for scenario in cases {
+            let root = try makeTemporaryDirectory(prefix: "TinkerBarSnapshotIntegrityTests")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let summaryFile = root.appendingPathComponent("latest-summary.json")
+            let ledgerFile = root.appendingPathComponent("ledger.jsonl")
+            var summary: [String: Any] = [
+                "ledgerGeneration": scenario.generation, "rows": 1, "timezone": "UTC",
+                "latestRecordedDate": "2026-07-13", "latestByHost": [],
+                "monthToDate": ["totalCostUSD": 9999, "byHost": []],
+                "today": ["totalCostUSD": 9999, "byHost": [], "unavailableHosts": []],
+            ]
+            if let schema = scenario.schema { summary["ledgerSchemaVersion"] = schema }
+            try JSONSerialization.data(withJSONObject: summary).write(to: summaryFile)
+            try #"{"ledgerGeneration":"generation-a","date":"2026-07-13","host":"local","costUSD":9999}"#
+                .write(to: ledgerFile, atomically: true, encoding: .utf8)
+
+            let snapshot = try XCTUnwrap(CodexUsageSnapshot.load(summaryFile: summaryFile, ledgerFile: ledgerFile))
+            XCTAssertFalse(snapshot.isEstimateAvailable, scenario.message)
+            XCTAssertEqual([snapshot.totalRow.allTime, snapshot.totalRow.monthToDate, snapshot.totalRow.today], ["—", "—", "—"])
+            XCTAssertEqual(snapshot.availabilityMessageText, scenario.message)
+            XCTAssertEqual(snapshot.menuBarBadgeText, "TinkerBar")
+            XCTAssertEqual(snapshot.todayMenuBarBadgeText, "TinkerBar")
+            if scenario.schema == nil {
+                XCTAssertTrue(snapshot.estimateNoticeText.contains("rebuild is required"))
+            }
         }
-
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerRollbackTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let usageTask = try XCTUnwrap(
-            TaskCatalog(appSupportDirectory: root)
-                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
-        )
-        let fakeLocal = root.appendingPathComponent("fake-ccusage")
-        let fakeSSH = root.appendingPathComponent("fake-ssh")
-        try fakeLocalUsageScript.write(to: fakeLocal, atomically: true, encoding: .utf8)
-        try fakeRemoteUsageScript.write(to: fakeSSH, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLocal.path)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSSH.path)
-
-        let legacyLedger = """
-        {"date":"\(utcDateString(daysFromToday: -1))","host":"local","costUSD":9999,"totalTokens":1,"pricingAdjustment":{"mode":"legacy"}}
-
-        """
-        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
-
-        let exitCode = try runLedgerWorker(
-            usageTask,
-            root: root,
-            localCollector: fakeLocal,
-            remoteCollector: fakeSSH,
-            remoteHosts: "offline"
-        )
-        XCTAssertEqual(exitCode, 1)
-        XCTAssertEqual(
-            try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8),
-            legacyLedger
-        )
-
-        let backupNames = try FileManager.default.contentsOfDirectory(
-            atPath: usageTask.paths.taskDirectory.path
-        ).filter { $0.hasPrefix("ledger.jsonl.rebuild-") && $0.hasSuffix(".bak") }
-        XCTAssertTrue(backupNames.isEmpty)
-
-        let status = try String(contentsOf: usageTask.paths.statusFile, encoding: .utf8)
-        XCTAssertTrue(status.contains("Ledger rebuild not committed"), status)
-        XCTAssertTrue(status.contains("Previous ledger retained"), status)
-    }
-
-    func testTruncatedRebuildCoverageCannotReplaceEarlierHistory() throws {
-        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
-            throw XCTSkip("Codex usage worker requires jq and perl")
-        }
-
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerCoverageTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-        let usageTask = try XCTUnwrap(
-            TaskCatalog(appSupportDirectory: root)
-                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
-        )
-        let fakeLocal = root.appendingPathComponent("fake-ccusage")
-        try fakeLocalUsageScript.write(to: fakeLocal, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLocal.path)
-
-        let legacyLedger = """
-        {"date":"2026-01-01","host":"local","costUSD":1,"totalTokens":1}
-
-        """
-        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
-
-        XCTAssertEqual(
-            try runLedgerWorker(usageTask, root: root, localCollector: fakeLocal),
-            1
-        )
-        XCTAssertEqual(
-            try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8),
-            legacyLedger
-        )
-        let log = try String(contentsOf: usageTask.paths.logFile, encoding: .utf8)
-        XCTAssertTrue(log.contains("Incomplete usage coverage from local"), log)
-    }
-
-    func testEmptyRebuildResponseCannotEraseExistingHostHistory() throws {
-        guard executable(named: "jq") != nil, executable(named: "perl") != nil else {
-            throw XCTSkip("Codex usage worker requires jq and perl")
-        }
-
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerEmptyRebuildTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let usageTask = try XCTUnwrap(
-            TaskCatalog(appSupportDirectory: root)
-                .discoverTasks().tasks.first(where: { $0.id == "codex-usage-ledger" })
-        )
-        let emptyCollector = root.appendingPathComponent("empty-ccusage")
-        try "#!/bin/zsh\nprint -r -- '{\"daily\":[],\"totals\":{}}'\n".write(
-            to: emptyCollector,
-            atomically: true,
-            encoding: .utf8
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: emptyCollector.path
-        )
-
-        let legacyLedger = """
-        {"date":"2026-01-01","host":"local","costUSD":9999,"totalTokens":1}
-
-        """
-        try legacyLedger.write(to: usageTask.paths.ledgerFile, atomically: true, encoding: .utf8)
-
-        XCTAssertEqual(
-            try runLedgerWorker(
-                usageTask,
-                root: root,
-                localCollector: emptyCollector
-            ),
-            1
-        )
-        XCTAssertEqual(
-            try String(contentsOf: usageTask.paths.ledgerFile, encoding: .utf8),
-            legacyLedger
-        )
-        let status = try String(contentsOf: usageTask.paths.statusFile, encoding: .utf8)
-        let log = try String(contentsOf: usageTask.paths.logFile, encoding: .utf8)
-        XCTAssertTrue(log.contains("Empty usage response from local"), log)
-        XCTAssertTrue(status.contains("Ledger rebuild not committed"), status)
-        XCTAssertTrue(status.contains("Previous ledger retained"), status)
-    }
-
-    func testLegacySnapshotSuppressesKnownInvalidDollarTotals() throws {
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarLegacySnapshotTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-        let summaryFile = root.appendingPathComponent("latest-summary.json")
-        let ledgerFile = root.appendingPathComponent("ledger.jsonl")
-
-        try #"{"timezone":"UTC","latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":6855.45,"byHost":[{"host":"local","totalCostUSD":6855.45}]},"latestByHost":[{"host":"local","costUSD":9999}],"today":{"totalCostUSD":950.29,"byHost":[{"host":"local","costUSD":950.29}],"unavailableHosts":[]}}"#.write(
-            to: summaryFile,
-            atomically: true,
-            encoding: .utf8
-        )
-        try #"{"date":"2026-07-13","host":"local","costUSD":9999}"#.write(
-            to: ledgerFile,
-            atomically: true,
-            encoding: .utf8
-        )
-
-        let snapshot = try XCTUnwrap(
-            CodexUsageSnapshot.load(summaryFile: summaryFile, ledgerFile: ledgerFile)
-        )
-        XCTAssertEqual(snapshot.totalRow.allTime, "—")
-        XCTAssertEqual(snapshot.totalRow.monthToDate, "—")
-        XCTAssertEqual(snapshot.totalRow.today, "—")
-        XCTAssertFalse(snapshot.isEstimateAvailable)
-        XCTAssertEqual(snapshot.availabilityMessageText, "Codex ledger rebuild required")
-        XCTAssertEqual(snapshot.menuBarBadgeText, "TinkerBar")
-        XCTAssertEqual(snapshot.todayMenuBarBadgeText, "TinkerBar")
-        XCTAssertTrue(snapshot.estimateNoticeText.contains("rebuild is required"))
     }
 
     func testMalformedOptionalOfficialUsageDoesNotHideValidEstimate() throws {
@@ -584,34 +364,6 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         XCTAssertTrue(snapshot.isEstimateAvailable)
         XCTAssertNil(snapshot.officialUsageText)
         XCTAssertEqual(snapshot.modelSummaryText, "Recent models: gpt-5.6-sol")
-    }
-
-    func testMismatchedLedgerGenerationSuppressesMixedSnapshot() throws {
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerGenerationTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-        let summaryFile = root.appendingPathComponent("latest-summary.json")
-        let ledgerFile = root.appendingPathComponent("ledger.jsonl")
-
-        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"summary-generation","rows":1,"timezone":"UTC","collector":{"version":"20.0.20","speed":"standard"},"latestRecordedDate":"2026-07-13","collection":{"expectedHosts":["local"],"historicalFailedHosts":[]},"monthToDate":{"totalCostUSD":9999,"byHost":[{"host":"local","totalCostUSD":9999}]},"latestByHost":[{"host":"local","costUSD":9999}],"today":{"totalCostUSD":9999,"byHost":[{"host":"local","costUSD":9999}],"unavailableHosts":[]}}"#.write(
-            to: summaryFile,
-            atomically: true,
-            encoding: .utf8
-        )
-        try #"{"ledgerSchemaVersion":2,"ledgerGeneration":"ledger-generation","date":"2026-07-13","host":"local","costUSD":1.25}"#.write(
-            to: ledgerFile,
-            atomically: true,
-            encoding: .utf8
-        )
-
-        let snapshot = try XCTUnwrap(
-            CodexUsageSnapshot.load(summaryFile: summaryFile, ledgerFile: ledgerFile)
-        )
-        XCTAssertFalse(snapshot.isEstimateAvailable)
-        XCTAssertEqual(snapshot.totalRow.allTime, "—")
-        XCTAssertEqual(
-            snapshot.availabilityMessageText,
-            "Codex ledger update incomplete; run the usage task again."
-        )
     }
 
     func testCancellationStopsNestedUsageFetchProcessGroup() async throws {
@@ -761,6 +513,22 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
         """#
     }
 
+    private func makeLedgerFixture(
+        collectorScript: String
+    ) throws -> (root: URL, task: AutomationTaskState, collector: URL) {
+        guard ["jq", "perl"].allSatisfy({ executable(named: $0) != nil }) else {
+            throw XCTSkip("Codex usage worker requires jq and perl")
+        }
+        let root = try makeTemporaryDirectory(prefix: "TinkerBarLedgerTests")
+        let task = try XCTUnwrap(TaskCatalog(appSupportDirectory: root).discoverTasks().tasks.first {
+            $0.id == "codex-usage-ledger"
+        })
+        let collector = root.appendingPathComponent("fake-ccusage")
+        try collectorScript.write(to: collector, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: collector.path)
+        return (root, task, collector)
+    }
+
     private func runLedgerWorker(
         _ usageTask: AutomationTaskState,
         root: URL,
@@ -819,32 +587,46 @@ final class CodexUsageLedgerIntegrationTests: XCTestCase {
 
 final class AutomationRuntimeCancellationTests: XCTestCase {
     @MainActor
-    func testRuntimeCancellationReturnsTaskToIdle() async throws {
-        let root = try makeTemporaryDirectory(prefix: "TinkerBarRuntimeCancellationTests")
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        try writeCatalogTask(appSupportDirectory: root)
-        let executor = CancellationAwareExecutor()
+    func testRuntimeCancellationStopsWorkerAndReturnsTaskToIdle() async throws {
+        let fixture = try makeTaskFixture(script: sleepingWorkerScript, status: staleWorkerStatus)
+        var childPID: pid_t?
+        defer {
+            if let childPID, processExists(childPID) { _ = Darwin.kill(childPID, SIGKILL) }
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
         let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: root, installsBuiltInTasks: false),
-            runner: TaskRunner(executionTimeout: 10, commandExecutor: executor.execute),
+            catalog: TaskCatalog(appSupportDirectory: fixture.root, installsBuiltInTasks: false),
+            runner: TaskRunner(executionTimeout: 5),
             autoload: false,
             loadStartupState: false
         )
         runtime.reloadTasks()
-
-        runtime.runTaskNow("cancel-me")
-        let started = await waitUntilOnMainActor(timeout: 2) {
-            executor.callCount == 1 && runtime.tasks.first?.isRunning == true
+        runtime.runTaskNow(fixture.task.id)
+        do {
+            let childFile = fixture.task.paths.taskDirectory.appendingPathComponent("child.pid")
+            let started = await waitUntilOnMainActor(timeout: 2) {
+                runtime.tasks.first?.isRunning == true && FileManager.default.fileExists(atPath: childFile.path)
+            }
+            XCTAssertTrue(started, "Real worker did not start")
+            let processID = try readChildPID(from: fixture.task.paths.taskDirectory)
+            childPID = processID
+            runtime.cancelTaskRun(fixture.task.id)
+            let stopped = await waitUntilOnMainActor(timeout: 2) {
+                runtime.tasks.first?.isRunning == false
+            }
+            XCTAssertTrue(stopped)
+            XCTAssertEqual(runtime.message, "Reliability Task stopped.")
+            let snapshot = try XCTUnwrap(runtime.tasks.first?.snapshot)
+            XCTAssertTrue(snapshot.lastError.contains("stopped before completion"))
+            let persisted = try String(contentsOf: fixture.task.paths.statusFile, encoding: .utf8)
+            XCTAssertTrue(persisted.contains("last_error\t\(snapshot.lastError)"), persisted)
+            XCTAssertFalse(persisted.contains("last_error\tstale worker failure"), persisted)
+            XCTAssertTrue(waitForProcessToExit(processID, timeout: 2), processDescription(processID))
+        } catch {
+            await runtime.cancelAllTaskRuns()
+            throw error
         }
-        XCTAssertTrue(started)
-
-        runtime.cancelTaskRun("cancel-me")
-        let stopped = await waitUntilOnMainActor(timeout: 2) {
-            runtime.tasks.first?.isRunning == false
-        }
-        XCTAssertTrue(stopped)
-        XCTAssertEqual(runtime.message, "Cancel Me stopped.")
+        await runtime.cancelAllTaskRuns()
     }
 }
 
@@ -853,32 +635,13 @@ private struct TaskFixture {
     let task: AutomationTaskState
 }
 
-private final class CancellationAwareExecutor: @unchecked Sendable {
-    private let lock = NSLock()
-    private var calls = 0
-
-    var callCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return calls
-    }
-
-    func execute(
-        _ executable: String,
-        _ arguments: [String],
-        _ timeout: TimeInterval
-    ) -> CommandResult {
-        lock.lock()
-        calls += 1
-        lock.unlock()
-
-        while !Task.isCancelled {
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-
-        return CommandResult(exitCode: 143, stdout: "", stderr: "", termination: .cancelled)
-    }
-}
+private let sleepingWorkerScript = """
+#!/bin/zsh
+/bin/sleep 10 &
+child_pid=$!
+print -r -- "$child_pid" > "${0:h}/child.pid"
+wait "$child_pid"
+"""
 
 private func makeTaskFixture(
     script: String = "#!/bin/zsh\nexit 0\n",
@@ -891,7 +654,7 @@ private func makeTaskFixture(
     """
 ) throws -> TaskFixture {
     let root = try makeTemporaryDirectory(prefix: "TinkerBarRunnerTests")
-    let taskDirectory = root.appendingPathComponent("task", isDirectory: true)
+    let taskDirectory = root.appendingPathComponent("tasks/reliability-task", isDirectory: true)
     try FileManager.default.createDirectory(at: taskDirectory, withIntermediateDirectories: true)
 
     let paths = AutomationTaskPaths(taskDirectory: taskDirectory)
@@ -908,6 +671,7 @@ private func makeTaskFixture(
         intervalSeconds: 60,
         openPath: nil
     )
+    try JSONEncoder().encode(configuration).write(to: paths.configFile)
     let task = AutomationTaskState(
         configuration: configuration,
         paths: paths,
@@ -923,28 +687,6 @@ private func makeTemporaryDirectory(prefix: String) throws -> URL {
         .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
-}
-
-private func writeCatalogTask(appSupportDirectory: URL) throws {
-    let taskDirectory = appSupportDirectory
-        .appendingPathComponent("tasks", isDirectory: true)
-        .appendingPathComponent("cancel-me", isDirectory: true)
-    try FileManager.default.createDirectory(at: taskDirectory, withIntermediateDirectories: true)
-
-    let paths = AutomationTaskPaths(taskDirectory: taskDirectory)
-    let configuration = AutomationTaskConfiguration(
-        id: "cancel-me",
-        name: "Cancel Me",
-        detail: "Cancellation test",
-        scriptKind: nil,
-        triggerKind: .interval,
-        directoryPath: nil,
-        intervalSeconds: 60,
-        openPath: nil
-    )
-    let encoder = JSONEncoder()
-    try encoder.encode(configuration).write(to: paths.configFile)
-    try "#!/bin/zsh\nexit 0\n".write(to: paths.scriptFile, atomically: true, encoding: .utf8)
 }
 
 private func readChildPID(from directory: URL) throws -> pid_t {

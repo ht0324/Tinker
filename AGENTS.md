@@ -19,5 +19,11 @@ Follow existing Swift style: 4-space indentation, `UpperCamelCase` for types, `l
 ## Testing Guidelines
 Add focused XCTest coverage for behavior changes, then run the strict full suite. Launch the app and exercise user-visible flows through the menu bar when the change warrants manual verification. For task-format changes, confirm the task contract still holds: directory tasks receive `run.sh <directoryPath> <statusFile> <logFile>`, interval tasks receive `run.sh <statusFile> <logFile>`, and application tasks receive `run.sh <opened|closed|sync> <statusFile> <logFile>`.
 
+Keep one primary test owner for each contract:
+
+- Assert worker arguments in runtime execution tests; verify status-file creation and preservation through catalog discovery. Keep malformed TSV and write-failure coverage in `TaskStatusStoreTests`.
+- Share fixtures and table cases for ledger migrations and failed rebuilds. Make each migration input invalid for only the guard it exercises, and retain case-specific diagnostics.
+- Keep independent proof for native timers, filesystem callbacks, stale refreshes, timeout, cancellation, and ledger data retention. Prefer a real worker over a mock that manufactures the outcome under test.
+
 ## Commit & Pull Request Guidelines
 Current history uses short, imperative commit subjects such as `Build multi-task TinkerBar app`. Keep commits focused and descriptive. PRs should explain the user-visible change, note any task-folder or config contract changes, and include screenshots for menu/UI updates. If you changed task behavior, mention the exact manual verification steps you ran.

@@ -3,24 +3,6 @@ import XCTest
 @testable import TinkerBar
 
 final class TaskStatusStoreTests: XCTestCase {
-    func testCreatesCanonicalFileWithoutOverwritingExistingStatus() throws {
-        let fixture = try makeFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-
-        try TaskStatusStore.createFileIfNeeded(for: fixture.paths)
-        XCTAssertEqual(
-            try String(contentsOf: fixture.paths.statusFile, encoding: .utf8),
-            "last_run_iso\t\nlast_success_iso\t\nsuccess_count\t0\nlast_output\t\nlast_error\t\n"
-        )
-
-        try "custom_key\tkeep\n".write(to: fixture.paths.statusFile, atomically: true, encoding: .utf8)
-        try TaskStatusStore.createFileIfNeeded(for: fixture.paths)
-        XCTAssertEqual(
-            try String(contentsOf: fixture.paths.statusFile, encoding: .utf8),
-            "custom_key\tkeep\n"
-        )
-    }
-
     func testLoadsKnownFieldsAndRequiresBothSupportFiles() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

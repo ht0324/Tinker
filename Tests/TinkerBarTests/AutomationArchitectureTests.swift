@@ -23,37 +23,6 @@ final class TaskCatalogTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: paths.scriptFile, encoding: .utf8), bundledScript)
     }
 
-    func testReloadPreservesCustomWorkersInBuiltInFolders() throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        let taskIDs = ["codex-update", "codex-usage-ledger", "heic-to-jpeg", "parsec-macmini-mirror"]
-        var originalConfigurations: [String: Data] = [:]
-        for id in taskIDs {
-            let paths = try writeTask(id: id, name: id, triggerKind: .interval, appSupportDirectory: appSupportDirectory)
-            if id == "codex-usage-ledger" {
-                var configuration = try loadConfiguration(from: paths.configFile)
-                configuration.detail = "Track Codex spend for my custom worker."
-                try JSONEncoder().encode(configuration).write(to: paths.configFile)
-            }
-            originalConfigurations[id] = try Data(contentsOf: paths.configFile)
-        }
-
-        let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory)
-        for _ in 0..<2 {
-            let tasks = try catalog.discoverTasks().tasks
-            XCTAssertEqual(Set(tasks.map(\.id)), Set(taskIDs))
-            for task in tasks {
-                XCTAssertNil(task.configuration.scriptKind)
-                XCTAssertEqual(try Data(contentsOf: task.paths.configFile), originalConfigurations[task.id])
-                XCTAssertEqual(try String(contentsOf: task.paths.scriptFile, encoding: .utf8), "#!/bin/zsh\nexit 0\n")
-                XCTAssertFalse(FileManager.default.fileExists(
-                    atPath: task.paths.taskDirectory.appendingPathComponent("codex-usage-app-server.mjs").path
-                ))
-            }
-        }
-    }
-
     func testUsageWorkerInstallsItsHelperForACustomTaskID() throws {
         let appSupportDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
@@ -74,54 +43,44 @@ final class TaskCatalogTests: XCTestCase {
         ))
     }
 
-    func testDiscoversCustomTaskFolderAndCreatesStatusFile() throws {
+    func testDiscoveryPreservesCustomConfigurationWorkerAndStatus() throws {
         let appSupportDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        let taskDirectory = try writeTask(
-            id: "sample-interval",
-            name: "Sample Interval",
-            triggerKind: .interval,
+        let paths = try writeTask(
+            id: "codex-usage-ledger", name: "Custom Usage", triggerKind: .interval,
             appSupportDirectory: appSupportDirectory
         )
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: taskDirectory.scriptFile.path)
+        var configuration = try loadConfiguration(from: paths.configFile)
+        configuration.detail = "Track Codex spend for my custom worker."
+        try JSONEncoder().encode(configuration).write(to: paths.configFile)
+        let originalConfiguration = try Data(contentsOf: paths.configFile)
+        let originalWorker = try Data(contentsOf: paths.scriptFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.scriptFile.path)
 
-        let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false)
-        let tasks = try catalog.discoverTasks().tasks
-
-        XCTAssertEqual(tasks.map(\.id), ["sample-interval"])
-        XCTAssertEqual(tasks.first?.configuration.name, "Sample Interval")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: taskDirectory.statusFile.path))
-        XCTAssertTrue(tasks.first?.snapshot.filesInstalled == true)
-        let permissions = try FileManager.default.attributesOfItem(atPath: taskDirectory.scriptFile.path)[.posixPermissions] as? Int
-        XCTAssertEqual(permissions, 0o600)
-        guard case .success = TaskRunner().run(try XCTUnwrap(tasks.first)) else {
+        let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory)
+        let task = try XCTUnwrap(catalog.discoverTasks().tasks.first { $0.id == "codex-usage-ledger" })
+        XCTAssertNil(task.configuration.scriptKind)
+        XCTAssertEqual(task.configuration.name, "Custom Usage")
+        XCTAssertTrue(task.snapshot.filesInstalled)
+        XCTAssertEqual(
+            try String(contentsOf: paths.statusFile, encoding: .utf8),
+            "last_run_iso\t\nlast_success_iso\t\nsuccess_count\t0\nlast_output\t\nlast_error\t\n"
+        )
+        guard case .success = TaskRunner().run(task) else {
             return XCTFail("Readable workers must run without execute permission")
         }
-    }
 
-    func testSkipsInvalidTaskFolderWithoutFailingDiscovery() throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        try writeTask(
-            id: "sample-interval",
-            name: "Sample Interval",
-            triggerKind: .interval,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let brokenDirectory = appSupportDirectory
-            .appendingPathComponent("tasks", isDirectory: true)
-            .appendingPathComponent("broken", isDirectory: true)
-        try FileManager.default.createDirectory(at: brokenDirectory, withIntermediateDirectories: true)
-        try Data("not json".utf8).write(to: brokenDirectory.appendingPathComponent("task.json"))
-
-        let catalog = TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false)
-        let discovery = try catalog.discoverTasks()
-
-        XCTAssertEqual(discovery.tasks.map(\.id), ["sample-interval"])
-        XCTAssertEqual(discovery.skippedFolders, ["broken"])
+        let customStatus = "last_output\tKeep this status\ncustom_field\tkeep me too\n"
+        try customStatus.write(to: paths.statusFile, atomically: true, encoding: .utf8)
+        _ = try catalog.discoverTasks()
+        XCTAssertEqual(try Data(contentsOf: paths.configFile), originalConfiguration)
+        XCTAssertEqual(try Data(contentsOf: paths.scriptFile), originalWorker)
+        XCTAssertEqual(try String(contentsOf: paths.statusFile, encoding: .utf8), customStatus)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: paths.taskDirectory.appendingPathComponent("codex-usage-app-server.mjs").path
+        ))
+        let permissions = try FileManager.default.attributesOfItem(atPath: paths.scriptFile.path)[.posixPermissions] as? Int
+        XCTAssertEqual(permissions, 0o600)
     }
 
     func testMalformedBuiltInTaskDoesNotPreventOtherTasksFromLoading() throws {
@@ -144,83 +103,6 @@ final class TaskCatalogTests: XCTestCase {
         )
         XCTAssertEqual(discovery.skippedFolders, ["codex-usage-ledger"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: brokenDirectory.appendingPathComponent("run.sh").path))
-    }
-}
-
-final class TaskRunnerTests: XCTestCase {
-    func testDirectoryWorkerReceivesDirectoryStatusAndLogArguments() throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        let watchedDirectory = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.removeItem(at: appSupportDirectory)
-            try? FileManager.default.removeItem(at: watchedDirectory)
-        }
-
-        let paths = try writeTask(
-            id: "photos",
-            name: "Photos",
-            triggerKind: .directory,
-            directoryPath: watchedDirectory.path,
-            appSupportDirectory: appSupportDirectory
-        )
-        let task = AutomationTaskState(
-            configuration: try loadConfiguration(from: paths.configFile),
-            paths: paths,
-            snapshot: AutomationTaskSnapshot(),
-            isEnabled: true,
-            isRunning: false
-        )
-        let capture = CommandCapture()
-        let runner = TaskRunner(commandExecutor: capture.execute)
-
-        guard case .success = runner.run(task) else {
-            return XCTFail("Expected directory worker to succeed")
-        }
-
-        let call = try XCTUnwrap(capture.calls.first)
-        XCTAssertEqual(call.executable, "/bin/zsh")
-        XCTAssertEqual(call.arguments, [
-            paths.scriptFile.path,
-            watchedDirectory.path,
-            paths.statusFile.path,
-            paths.logFile.path,
-        ])
-    }
-
-    func testApplicationWorkerReceivesEventStatusAndLogArguments() throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        let paths = try writeTask(
-            id: "parsec",
-            name: "Parsec",
-            triggerKind: .application,
-            appSupportDirectory: appSupportDirectory,
-            applicationName: "Parsec",
-            bundleIdentifier: "tv.parsec.www"
-        )
-        let task = AutomationTaskState(
-            configuration: try loadConfiguration(from: paths.configFile),
-            paths: paths,
-            snapshot: AutomationTaskSnapshot(),
-            isEnabled: true,
-            isRunning: false
-        )
-        let capture = CommandCapture()
-        let runner = TaskRunner(commandExecutor: capture.execute)
-
-        guard case .success = runner.run(task, event: .opened) else {
-            return XCTFail("Expected application worker to succeed")
-        }
-
-        let call = try XCTUnwrap(capture.calls.first)
-        XCTAssertEqual(call.executable, "/bin/zsh")
-        XCTAssertEqual(call.arguments, [
-            paths.scriptFile.path,
-            "opened",
-            paths.statusFile.path,
-            paths.logFile.path,
-        ])
     }
 }
 
@@ -317,229 +199,109 @@ final class AutomationRuntimeTests: XCTestCase {
     }
 
     @MainActor
-    func testQuietHoursSuppressIntervalRuns() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        try writeTask(
-            id: "usage",
-            name: "Usage",
-            triggerKind: .interval,
-            intervalSeconds: 60,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "usage")
-
+    func testQuietHoursSuppressAutomaticRunsButAllowManualRuns() async throws {
         let calendar = makeUTCCalendar()
         let capture = CommandCapture()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+        let fixture = try makeRuntimeFixture(
+            enabled: true,
             runner: TaskRunner(commandExecutor: capture.execute),
-            enablementStore: enablementStore,
             quietHours: AutomationQuietHours(startHour: 1, endHour: 8, calendar: calendar),
-            dateProvider: { makeDate(hour: 2, calendar: calendar) },
-            autoload: false,
-            loadStartupState: false
+            dateProvider: { makeDate(hour: 2, calendar: calendar) }
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
         runtime.requestTaskRun("usage", source: .interval)
-        try? await Task.sleep(nanoseconds: 150_000_000)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(capture.calls.isEmpty)
 
-        XCTAssertEqual(capture.calls.count, 0)
-        runtime.toggleTask("usage")
-    }
-
-    @MainActor
-    func testManualRunsBypassQuietHours() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        try writeTask(
-            id: "usage",
-            name: "Usage",
-            triggerKind: .interval,
-            intervalSeconds: 60,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "usage")
-
-        let calendar = makeUTCCalendar()
-        let executor = BlockingCommandExecutor()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: executor.execute),
-            enablementStore: enablementStore,
-            quietHours: AutomationQuietHours(startHour: 1, endHour: 8, calendar: calendar),
-            dateProvider: { makeDate(hour: 2, calendar: calendar) },
-            autoload: false,
-            loadStartupState: false
-        )
-
-        runtime.reloadTasks()
         runtime.runTaskNow("usage")
-        let sawRun = await executor.waitForCallCount(1)
+        let sawRun = await capture.waitForCallCount(1)
         XCTAssertTrue(sawRun)
-
-        runtime.toggleTask("usage")
-        executor.unblockFirstCall()
-        let becameIdle = await executor.waitUntilIdle()
-        XCTAssertTrue(becameIdle)
+        let call = try XCTUnwrap(capture.calls.first)
+        XCTAssertEqual(call.executable, "/bin/zsh")
+        XCTAssertEqual(normalizedArguments(call.arguments), normalizedArguments([
+            fixture.paths.scriptFile.path, fixture.paths.statusFile.path, fixture.paths.logFile.path,
+        ]))
+        let finished = await waitUntilOnMainActor(timeout: 2) { runtime.tasks.first?.isRunning == false }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(capture.calls.count, 1)
     }
 
     @MainActor
     func testApplicationEventsBypassQuietHours() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        try writeTask(
-            id: "parsec",
-            name: "Parsec",
-            triggerKind: .application,
-            appSupportDirectory: appSupportDirectory,
-            applicationName: "Parsec",
-            bundleIdentifier: "tv.parsec.www"
-        )
-
         let calendar = makeUTCCalendar()
         let capture = CommandCapture()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
+        let fixture = try makeRuntimeFixture(
+            id: "parsec", triggerKind: .application,
             runner: TaskRunner(commandExecutor: capture.execute),
             quietHours: AutomationQuietHours(startHour: 1, endHour: 8, calendar: calendar),
-            dateProvider: { makeDate(hour: 2, calendar: calendar) },
-            autoload: false,
-            loadStartupState: false
+            dateProvider: { makeDate(hour: 2, calendar: calendar) }
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
         runtime.requestTaskRun("parsec", source: .application(.opened))
-
         let sawRun = await capture.waitForCallCount(1)
         XCTAssertTrue(sawRun)
-        XCTAssertEqual(capture.calls.first?.arguments.dropFirst().first, "opened")
+        let call = try XCTUnwrap(capture.calls.first)
+        XCTAssertEqual(call.executable, "/bin/zsh")
+        XCTAssertEqual(normalizedArguments(call.arguments), normalizedArguments([
+            fixture.paths.scriptFile.path, "opened", fixture.paths.statusFile.path, fixture.paths.logFile.path,
+        ]))
+        let finished = await waitUntilOnMainActor(timeout: 2) { runtime.tasks.first?.isRunning == false }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(runtime.tasks.first?.snapshot.lastError, "")
     }
 
     @MainActor
-    func testIntervalTaskRunsAfterConfiguredDelay() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        try writeTask(
-            id: "usage",
-            name: "Usage",
-            triggerKind: .interval,
-            intervalSeconds: 0.05,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "usage")
-
+    func testIntervalTimerStartsWorkerAfterDelay() async throws {
         let executor = BlockingCommandExecutor()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: executor.execute),
-            enablementStore: enablementStore,
-            autoload: false,
-            loadStartupState: false
+        defer { executor.unblockFirstCall() }
+        let fixture = try makeRuntimeFixture(
+            intervalSeconds: 1, enabled: true,
+            runner: TaskRunner(commandExecutor: executor.execute)
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
-        let sawRun = await executor.waitForCallCount(1)
+        XCTAssertFalse(try XCTUnwrap(runtime.tasks.first).isRunning)
+        let sawRun = await executor.waitForCallCount(1, timeout: 7)
         XCTAssertTrue(sawRun)
 
         runtime.toggleTask("usage")
         executor.unblockFirstCall()
-        let becameIdle = await executor.waitUntilIdle()
-        XCTAssertTrue(becameIdle)
+        let finished = await waitUntilOnMainActor(timeout: 2) { runtime.tasks.first?.isRunning == false }
+        XCTAssertTrue(finished)
     }
 
     @MainActor
     func testIntervalTaskRunsImmediatelyWhenOverdue() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        let paths = try writeTask(
-            id: "usage",
-            name: "Usage",
-            triggerKind: .interval,
-            intervalSeconds: 60,
-            appSupportDirectory: appSupportDirectory
-        )
-        try writeStatus(lastRun: Date(timeIntervalSinceNow: -120), to: paths.statusFile)
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "usage")
-
+        let now = makeDate(hour: 12, calendar: makeUTCCalendar())
         let executor = BlockingCommandExecutor()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: executor.execute),
-            enablementStore: enablementStore,
-            autoload: false,
-            loadStartupState: false
+        defer { executor.unblockFirstCall() }
+        let fixture = try makeRuntimeFixture(
+            enabled: true, lastRun: now.addingTimeInterval(-120),
+            runner: TaskRunner(commandExecutor: executor.execute), dateProvider: { now }
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
+        XCTAssertTrue(try XCTUnwrap(runtime.tasks.first).isRunning)
         let sawRun = await executor.waitForCallCount(1)
         XCTAssertTrue(sawRun)
 
         runtime.toggleTask("usage")
         executor.unblockFirstCall()
-        let becameIdle = await executor.waitUntilIdle()
-        XCTAssertTrue(becameIdle)
+        let finished = await waitUntilOnMainActor(timeout: 2) { runtime.tasks.first?.isRunning == false }
+        XCTAssertTrue(finished)
     }
 
     @MainActor
     func testRecentIntervalRunWaitsOnReloadButRunsWhenEnabledManually() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        let paths = try writeTask(
-            id: "usage", name: "Usage", triggerKind: .interval,
-            appSupportDirectory: appSupportDirectory
-        )
         let now = makeDate(hour: 12, calendar: makeUTCCalendar())
-        try writeStatus(lastRun: now, to: paths.statusFile)
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "usage")
-
         let capture = CommandCapture()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: capture.execute),
-            enablementStore: enablementStore,
-            quietHours: AutomationQuietHours(startHour: 1, endHour: 8, calendar: makeUTCCalendar()),
-            dateProvider: { now },
-            autoload: false,
-            loadStartupState: false
+        let fixture = try makeRuntimeFixture(
+            enabled: true, lastRun: now,
+            runner: TaskRunner(commandExecutor: capture.execute), dateProvider: { now }
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
         XCTAssertFalse(try XCTUnwrap(runtime.tasks.first).isRunning)
         try await Task.sleep(for: .milliseconds(150))
@@ -550,50 +312,32 @@ final class AutomationRuntimeTests: XCTestCase {
         let sawRun = await capture.waitForCallCount(1)
         XCTAssertTrue(sawRun)
         runtime.toggleTask("usage")
-        await runtime.cancelAllTaskRuns()
+        let finished = await waitUntilOnMainActor(timeout: 2) { runtime.tasks.first?.isRunning == false }
+        XCTAssertTrue(finished)
     }
 
     @MainActor
-    func testDirectoryTriggersCoalesceOneFollowUpWhileRunning() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        let watchedDirectory = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.removeItem(at: appSupportDirectory)
-            try? FileManager.default.removeItem(at: watchedDirectory)
-        }
-
-        try writeTask(
-            id: "photos",
-            name: "Photos",
-            triggerKind: .directory,
-            directoryPath: watchedDirectory.path,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "photos")
-
+    func testRunningDirectoryTaskSurvivesReloadAndCoalescesOneFollowUp() async throws {
         let executor = BlockingCommandExecutor()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: executor.execute),
-            enablementStore: enablementStore,
-            autoload: false,
-            loadStartupState: false
+        defer { executor.unblockFirstCall() }
+        let fixture = try makeRuntimeFixture(
+            id: "photos", triggerKind: .directory, enabled: true,
+            runner: TaskRunner(commandExecutor: executor.execute)
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
-        XCTAssertEqual(runtime.tasks.map(\.id), ["photos"])
-
         runtime.requestTaskRun("photos", source: .directory)
         let sawFirstRun = await executor.waitForCallCount(1)
         XCTAssertTrue(sawFirstRun)
-        XCTAssertTrue(runtime.tasks.first?.isRunning == true)
+        let call = try XCTUnwrap(executor.calls.first)
+        XCTAssertEqual(call.executable, "/bin/zsh")
+        XCTAssertEqual(normalizedArguments(call.arguments), normalizedArguments([
+            fixture.paths.scriptFile.path, fixture.watchedDirectory.path,
+            fixture.paths.statusFile.path, fixture.paths.logFile.path,
+        ]))
 
+        runtime.reloadTasks()
+        XCTAssertTrue(try XCTUnwrap(runtime.tasks.first).isRunning)
         runtime.requestTaskRun("photos", source: .directory)
         runtime.requestTaskRun("photos", source: .directory)
         XCTAssertEqual(executor.callCount, 1)
@@ -601,203 +345,79 @@ final class AutomationRuntimeTests: XCTestCase {
         executor.unblockFirstCall()
         let sawCoalescedRun = await executor.waitForCallCount(2)
         XCTAssertTrue(sawCoalescedRun)
-        let becameIdle = await executor.waitUntilIdle()
-        XCTAssertTrue(becameIdle)
-        XCTAssertEqual(executor.callCount, 2)
-        XCTAssertTrue(runtime.tasks.first?.isRunning == false)
-
-        runtime.toggleTask("photos")
-    }
-
-    @MainActor
-    func testRunningTaskSurvivesReloadAndFinishesNormally() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        try writeTask(
-            id: "usage",
-            name: "Usage",
-            triggerKind: .interval,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let executor = BlockingCommandExecutor()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: executor.execute),
-            autoload: false,
-            loadStartupState: false
-        )
-
-        runtime.reloadTasks()
-        runtime.runTaskNow("usage")
-        let started = await executor.waitForCallCount(1)
-        XCTAssertTrue(started)
-
-        runtime.reloadTasks()
-        XCTAssertTrue(runtime.tasks.first?.isRunning == true)
-
-        executor.unblockFirstCall()
-        let finished = await waitUntilOnMainActor(timeout: 2) {
-            runtime.tasks.first?.isRunning == false
-        }
+        let finished = await waitUntilOnMainActor(timeout: 2) { runtime.tasks.first?.isRunning == false }
         XCTAssertTrue(finished)
-        XCTAssertEqual(executor.callCount, 1)
+        XCTAssertEqual(runtime.tasks.first?.snapshot.lastError, "")
+        XCTAssertEqual(executor.callCount, 2)
     }
 
     @MainActor
     func testDisablingTaskDropsCoalescedDirectoryRun() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        let watchedDirectory = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.removeItem(at: appSupportDirectory)
-            try? FileManager.default.removeItem(at: watchedDirectory)
-        }
-
-        try writeTask(
-            id: "photos",
-            name: "Photos",
-            triggerKind: .directory,
-            directoryPath: watchedDirectory.path,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "photos")
         let executor = BlockingCommandExecutor()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: executor.execute),
-            enablementStore: enablementStore,
-            autoload: false,
-            loadStartupState: false
+        defer { executor.unblockFirstCall() }
+        let fixture = try makeRuntimeFixture(
+            id: "photos", triggerKind: .directory, enabled: true,
+            runner: TaskRunner(commandExecutor: executor.execute)
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
         runtime.requestTaskRun("photos", source: .directory)
         let started = await executor.waitForCallCount(1)
         XCTAssertTrue(started)
         runtime.requestTaskRun("photos", source: .directory)
-
         runtime.toggleTask("photos")
         executor.unblockFirstCall()
-        let finished = await waitUntilOnMainActor(timeout: 2) {
-            runtime.tasks.first?.isRunning == false
-        }
-
+        let finished = await waitUntilOnMainActor(timeout: 2) { runtime.tasks.first?.isRunning == false }
         XCTAssertTrue(finished)
         XCTAssertEqual(executor.callCount, 1)
-        XCTAssertTrue(runtime.tasks.first?.isEnabled == false)
+        XCTAssertFalse(try XCTUnwrap(runtime.tasks.first).isEnabled)
     }
 
     @MainActor
     func testQueuedDirectoryCallbackDoesNotRunAfterDisable() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        let watchedDirectory = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.removeItem(at: appSupportDirectory)
-            try? FileManager.default.removeItem(at: watchedDirectory)
-        }
-
-        try writeTask(
-            id: "photos",
-            name: "Photos",
-            triggerKind: .directory,
-            directoryPath: watchedDirectory.path,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let enablementStore = TaskEnablementStore(defaults: defaults)
-        enablementStore.setEnabled(true, taskID: "photos")
         let capture = CommandCapture()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            runner: TaskRunner(commandExecutor: capture.execute),
-            enablementStore: enablementStore,
-            autoload: false,
-            loadStartupState: false
+        let fixture = try makeRuntimeFixture(
+            id: "photos", triggerKind: .directory, enabled: true,
+            runner: TaskRunner(commandExecutor: capture.execute)
         )
-
+        let runtime = fixture.runtime
         runtime.reloadTasks()
-        try Data("queued".utf8).write(to: watchedDirectory.appendingPathComponent("queued.heic"))
+        try Data("queued".utf8).write(to: fixture.watchedDirectory.appendingPathComponent("queued.heic"))
 
-        // Keep the main actor occupied long enough for the monitor queue to
-        // enqueue its callback, then invalidate that registration before it runs.
+        // Let the monitor queue enqueue a callback while the main actor is busy,
+        // then invalidate its registration before the callback can resume.
         usleep(1_000_000)
         runtime.toggleTask("photos")
-        try? await Task.sleep(for: .seconds(1))
-
-        XCTAssertEqual(capture.calls.count, 0)
-        XCTAssertTrue(runtime.tasks.first?.isEnabled == false)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertTrue(capture.calls.isEmpty)
+        XCTAssertFalse(try XCTUnwrap(runtime.tasks.first).isEnabled)
     }
 
     @MainActor
     func testRefreshPublishesTaskSnapshotChanges() throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        let paths = try writeTask(
-            id: "usage",
-            name: "Usage",
-            triggerKind: .interval,
-            intervalSeconds: 60,
-            appSupportDirectory: appSupportDirectory
-        )
-
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            autoload: false,
-            loadStartupState: false
-        )
+        let fixture = try makeRuntimeFixture()
+        let runtime = fixture.runtime
         runtime.reloadTasks()
-
         let expectedLastRun = "2026-04-30T06:44:10Z"
-        try writeStatus(lastRunISO: expectedLastRun, to: paths.statusFile)
+        try writeStatus(lastRunISO: expectedLastRun, to: fixture.paths.statusFile)
 
         let publishExpectation = expectation(description: "refresh publishes task snapshot changes")
         var cancellables = Set<AnyCancellable>()
         runtime.objectWillChange
-            .sink {
-                publishExpectation.fulfill()
-            }
+            .sink { publishExpectation.fulfill() }
             .store(in: &cancellables)
-
         runtime.refresh()
-
         wait(for: [publishExpectation], timeout: 1)
         XCTAssertEqual(runtime.tasks.first?.snapshot.lastRunISO, expectedLastRun)
     }
 
     @MainActor
     func testRefreshIgnoresOlderResultsThatCompleteLate() async throws {
-        let appSupportDirectory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: appSupportDirectory) }
-
-        try writeTask(
-            id: "usage",
-            name: "Usage",
-            triggerKind: .interval,
-            intervalSeconds: 60,
-            appSupportDirectory: appSupportDirectory
-        )
-
         let loader = OrderedSnapshotLoader()
-        let runtime = AutomationRuntime(
-            catalog: TaskCatalog(appSupportDirectory: appSupportDirectory, installsBuiltInTasks: false),
-            snapshotLoader: loader.snapshot,
-            autoload: false,
-            loadStartupState: false
-        )
+        defer { loader.unblockFirstCall() }
+        let fixture = try makeRuntimeFixture(snapshotLoader: loader.snapshot)
+        let runtime = fixture.runtime
         runtime.reloadTasks()
-
         runtime.refresh()
         let sawFirstRefresh = await loader.waitForCallCount(1)
         XCTAssertTrue(sawFirstRefresh)
@@ -811,15 +431,72 @@ final class AutomationRuntimeTests: XCTestCase {
         XCTAssertTrue(appliedSecondRefresh)
 
         loader.unblockFirstCall()
-        try? await Task.sleep(nanoseconds: 100_000_000)
-
+        try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(runtime.tasks.first?.snapshot.lastRunISO, "newer-refresh")
+    }
+
+    @MainActor
+    private func makeRuntimeFixture(
+        id: String = "usage",
+        triggerKind: AutomationTriggerKind = .interval,
+        intervalSeconds: Double? = 60,
+        enabled: Bool = false,
+        lastRun: Date? = nil,
+        runner: TaskRunner = TaskRunner(),
+        quietHours: AutomationQuietHours = AutomationQuietHours(startHour: 0, endHour: 0),
+        dateProvider: @escaping () -> Date = Date.init,
+        snapshotLoader: @escaping @Sendable (AutomationTaskPaths) -> AutomationTaskSnapshot = {
+            TaskStatusStore.snapshot(for: $0)
+        }
+    ) throws -> (runtime: AutomationRuntime, paths: AutomationTaskPaths, watchedDirectory: URL) {
+        let root = try makeTemporaryDirectory()
+        let suiteName = "TinkerBarTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock {
+            UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let watchedDirectory = root.appendingPathComponent("watched", isDirectory: true)
+        if triggerKind == .directory {
+            try FileManager.default.createDirectory(at: watchedDirectory, withIntermediateDirectories: true)
+        }
+        let paths = try writeTask(
+            id: id, name: id, triggerKind: triggerKind,
+            directoryPath: triggerKind == .directory ? watchedDirectory.path : nil,
+            intervalSeconds: intervalSeconds, appSupportDirectory: root,
+            applicationName: triggerKind == .application ? "Parsec" : nil,
+            bundleIdentifier: triggerKind == .application ? "tv.parsec.www" : nil
+        )
+        if let lastRun { try writeStatus(lastRun: lastRun, to: paths.statusFile) }
+        let enablementStore = TaskEnablementStore(defaults: defaults)
+        enablementStore.setEnabled(enabled, taskID: id)
+        let runtime = AutomationRuntime(
+            catalog: TaskCatalog(appSupportDirectory: root, installsBuiltInTasks: false),
+            runner: runner, enablementStore: enablementStore, quietHours: quietHours,
+            dateProvider: dateProvider, snapshotLoader: snapshotLoader,
+            autoload: false, loadStartupState: false
+        )
+        addTeardownBlock { @MainActor in
+            for task in runtime.tasks where task.isEnabled { runtime.toggleTask(task.id) }
+            await runtime.cancelAllTaskRuns()
+        }
+        return (runtime, paths, watchedDirectory)
     }
 }
 
 private struct CommandCall: Sendable {
     let executable: String
     let arguments: [String]
+}
+
+private func normalizedArguments(_ arguments: [String]) -> [String] {
+    arguments.map {
+        guard $0.hasPrefix("/") else { return $0 }
+        let url = URL(fileURLWithPath: $0)
+        // Resolve the existing parent because the worker may not have created task.log yet.
+        return url.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(url.lastPathComponent).path
+    }
 }
 
 private final class CommandCapture: @unchecked Sendable {
@@ -869,15 +546,16 @@ private final class EventCounter: @unchecked Sendable {
 
 private final class BlockingCommandExecutor: @unchecked Sendable {
     private let condition = NSCondition()
-    private var currentCallCount = 0
+    private var recordedCalls: [CommandCall] = []
     private var firstCallIsUnblocked = false
-    private var activeCalls = 0
 
-    var callCount: Int {
+    var calls: [CommandCall] {
         condition.lock()
         defer { condition.unlock() }
-        return currentCallCount
+        return recordedCalls
     }
+
+    var callCount: Int { calls.count }
 
     func execute(
         _ executable: String,
@@ -885,17 +563,9 @@ private final class BlockingCommandExecutor: @unchecked Sendable {
         _ timeout: TimeInterval
     ) -> CommandResult {
         condition.lock()
-        currentCallCount += 1
-        activeCalls += 1
-        let callNumber = currentCallCount
-        condition.broadcast()
-
-        while callNumber == 1 && !firstCallIsUnblocked {
-            condition.wait()
-        }
-
-        activeCalls -= 1
-        condition.broadcast()
+        recordedCalls.append(CommandCall(executable: executable, arguments: arguments))
+        let callNumber = recordedCalls.count
+        while callNumber == 1 && !firstCallIsUnblocked { condition.wait() }
         condition.unlock()
         return CommandResult(exitCode: 0, stdout: "", stderr: "")
     }
@@ -908,18 +578,7 @@ private final class BlockingCommandExecutor: @unchecked Sendable {
     }
 
     func waitForCallCount(_ expectedCount: Int, timeout: TimeInterval = 2) async -> Bool {
-        await waitUntil(timeout: timeout) {
-            self.callCount >= expectedCount
-        }
-    }
-
-    func waitUntilIdle(timeout: TimeInterval = 2) async -> Bool {
-        await waitUntil(timeout: timeout) {
-            self.condition.lock()
-            let isIdle = self.activeCalls == 0
-            self.condition.unlock()
-            return isIdle
-        }
+        await waitUntil(timeout: timeout) { self.callCount >= expectedCount }
     }
 }
 
